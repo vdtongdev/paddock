@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "paddock-mem": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--no-project",
+        "--script",
+        "scripts/paddock_core/mcp_server.py"
+      ],
+      "env": {
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

@@ -1,0 +1,100 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" pre-tool-use",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" pre-tool-use",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Grep|Glob|WebFetch|WebSearch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" pre-tool-use",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" pre-tool-use",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" pre-tool-use",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" pre-tool-use",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" post-tool-use",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" post-tool-use",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" user-prompt-submit",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" user-prompt-submit",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" session-start",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" session-start",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" subagent-start",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" subagent-start",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" subagent-stop",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" subagent-stop",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

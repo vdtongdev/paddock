@@ -1,0 +1,13 @@
+{
+  "name": "paddock",
+  "owner": {
+    "name": "vdtongdev"
+  },
+  "plugins": [
+    {
+      "name": "paddock",
+      "source": "./platforms/claude",
+      "description": "Paddock multi-platform orchestration loop and unified ~/.paddock/ typed memory suite."
+    }
+  ]
+}

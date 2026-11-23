@@ -1,0 +1,40 @@
+{
+  "paddock": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "uv run --no-project --script scripts/agy_hooks.py SessionStart",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script scripts/agy_hooks.py PreToolUse",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "invoke_subagent|run_workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script scripts/agy_hooks.py PreToolUse",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "uv run --no-project --script scripts/agy_hooks.py Stop",
+        "timeout": 15
+      }
+    ]
+  }
+}
