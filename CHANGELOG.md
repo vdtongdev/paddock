@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-25
+
 ### Added
 - Canonical platform-agnostic specialist definitions (`core/agents/*.md`) and stdlib compiler/applier (`core/config/agents.py`) compiling Antigravity (`paddock-*.md`) and Claude Code (`*.md`) profiles with capability-to-tool mapping and role footers.
 - Versioned multi-provider model configuration engine (`core/config/models.py`, `schema_version: 1`) supporting global (`~/.paddock/models.json`) and worktree-shared per-project (`~/.paddock/projects/<slug>/models.json`) precedence, `budget`/`balanced`/`quality` presets, `google`/`anthropic`/`openai`/`native` tier catalogs, strict validation, atomic writes, and fail-open fallback.
@@ -30,3 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Separate `refresh_layer()` `(problems, notices)` return so backing up non-generated `MEMORY.md` to `MEMORY.md.bak` is reported as a notice rather than a validation error.
 - Exact resolved-path matching in `deprecate()` instead of substring filename matching.
 - Clean 3,000-character problem truncation in `format_problems_capped()` without emitting a leading `; ...` prefix.
+- In-place atomic Antigravity plugin reinstall in `scripts/install.py` with stale-entry pruning to prevent Windows `[WinError 32]` directory handle locks.
+
+[Unreleased]: https://github.com/vdtongdev/paddock/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/vdtongdev/paddock/releases/tag/v0.2.0
