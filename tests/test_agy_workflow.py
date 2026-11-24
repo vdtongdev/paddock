@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from core.config import models
 from core.memory import memory
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -110,10 +111,12 @@ def test_parse_plan_and_happy_path_with_trap_injection(
     assert len(summary["tasks"]) == 2
     assert phases == ["Task 1 — Implement Core", "Task 2 — Update Docs"]
     assert calls[0]["type_name"] == "paddock-implementer"
-    assert calls[0]["model"] == "flash"
+    assert calls[0]["model"] == "pro"
     assert "core-trap" in calls[0]["prompt"]
+    assert calls[1]["type_name"] == "paddock-verifier"
+    assert calls[1]["model"] == "pro"
     assert calls[2]["type_name"] == "paddock-generalist"
-    assert calls[2]["model"] == "flash_lite"
+    assert calls[2]["model"] == "flash"
 
 
 def test_retry_caps_two_impl_to_plan_and_plan_cap_escalation(tmp_path: Path) -> None:
@@ -240,3 +243,184 @@ def test_dispute_allowed_once_per_task_and_env_flaky_rerun(tmp_path: Path) -> No
         ns["run_build_loop"](plan_file, str(tmp_path), {}, agent_fn=fail_spec, trap_loader=lambda *a: [])
     )
     assert res5["status"] == "ESCALATED: spec"
+
+
+def test_models_json_subagent_alias_precedence_and_args_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paddock_home = tmp_path / "paddock"
+    monkeypatch.setenv("PADDOCK_HOME", str(paddock_home))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin_root = str(REPO_ROOT / "platforms" / "antigravity")
+
+    plan_file = repo / "plan.md"
+    plan_file.write_text(
+        """# Multi-Role Plan
+
+### Task 1 — Lookup
+- **Agent:** paddock-generalist
+- **Files:** README.md
+- **Scope:** Lookup docs.
+- **Acceptance:** Done.
+
+### Task 2 — Build Feature
+- **Agent:** paddock-implementer
+- **Files:** core/app.py
+- **Scope:** Implement feature.
+- **Acceptance:** Done.
+
+### Task 3 — Style UI
+- **Agent:** paddock-ui
+- **Files:** ui/view.tsx
+- **Scope:** Style screen.
+- **Acceptance:** Done.
+""",
+        encoding="utf-8",
+    )
+
+    # Case 1: Concrete Gemini 4 entries with project > global > default precedence
+    models.set_preset("budget", scope="global", cwd=repo, home=paddock_home)
+    models.set_role("ui", "flagship", scope="project", cwd=repo, home=paddock_home)
+
+    gemini_calls: list[tuple[str, str | None]] = []
+
+    async def record_gemini(prompt=None, schema=None, role=None, type_name="self", workspace="inherit", model=None):
+        gemini_calls.append((type_name, model))
+        if type_name == "paddock-verifier":
+            return {"verdict": "PASS", "summary": "ok", "evidence": [], "unverified": []}
+        return {"status": "DONE", "summary": "ok", "evidence": [], "unverified": []}
+
+    ns1 = _load_workflow_namespace(
+        {
+            "agent": record_gemini,
+            "WORKSPACES": (str(repo),),
+            "args": {"plan_path": "plan.md", "plugin_root": plugin_root},
+        }
+    )
+    assert ns1["_workflow_summary"]["status"] == "PASS"
+    assert gemini_calls == [
+        ("paddock-generalist", "flash"),
+        ("paddock-verifier", "flash"),
+        ("paddock-implementer", "flash"),
+        ("paddock-verifier", "flash"),
+        ("paddock-ui", "inherit"),
+        ("paddock-verifier", "flash"),
+    ]
+
+    # Case 2: Concrete Claude 5.5 entries (anthropic provider) + project overrides + Args.models overlay
+    models.reset_config(scope="all", cwd=repo, home=paddock_home)
+    models.set_preset("quality", scope="global", cwd=repo, home=paddock_home)
+    models.set_provider("antigravity", "anthropic", scope="global", cwd=repo, home=paddock_home)
+    models.set_override("antigravity", "generalist", model="flash_lite", scope="project", cwd=repo, home=paddock_home)
+    models.set_role("implementer", "workhorse", scope="project", cwd=repo, home=paddock_home)
+
+    claude_calls: list[tuple[str, str | None]] = []
+
+    async def record_claude(prompt=None, schema=None, role=None, type_name="self", workspace="inherit", model=None):
+        claude_calls.append((type_name, model))
+        if type_name == "paddock-verifier":
+            return {"verdict": "PASS", "summary": "ok", "evidence": [], "unverified": []}
+        return {"status": "DONE", "summary": "ok", "evidence": [], "unverified": []}
+
+    ns2 = _load_workflow_namespace(
+        {
+            "agent": record_claude,
+            "WORKSPACES": (str(repo),),
+            "args": {
+                "plan_path": "plan.md",
+                "plugin_root": plugin_root,
+                "models": {"implementer": "flash", "paddock-verifier": "pro", "ui": ""},
+            },
+        }
+    )
+    assert ns2["_workflow_summary"]["status"] == "PASS"
+    assert claude_calls == [
+        ("paddock-generalist", "flash_lite"),
+        ("paddock-verifier", "pro"),
+        ("paddock-implementer", "flash"),
+        ("paddock-verifier", "pro"),
+        ("paddock-ui", "pro"),
+        ("paddock-verifier", "pro"),
+    ]
+
+    # Base resolution (before Args.models overlay) maps claude-opus-5-5 -> inherit and claude-sonnet-5-5 -> pro
+    base_models = ns2["load_models_for_workflow"](str(repo), {"plugin_root": plugin_root})
+    assert base_models == {
+        "paddock-generalist": "flash_lite",
+        "paddock-implementer": "pro",
+        "paddock-ui": "pro",
+        "paddock-planner": "inherit",
+        "paddock-verifier": "inherit",
+    }
+
+
+def test_corrupt_models_json_falls_back_to_default_aliases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paddock_home = tmp_path / "paddock"
+    monkeypatch.setenv("PADDOCK_HOME", str(paddock_home))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    plugin_root = str(REPO_ROOT / "platforms" / "antigravity")
+
+    global_cfg = models.config_path("global", repo, home=paddock_home)
+    global_cfg.parent.mkdir(parents=True, exist_ok=True)
+    global_cfg.write_text("{corrupt json", encoding="utf-8")
+
+    project_cfg = models.config_path("project", repo, home=paddock_home)
+    project_cfg.parent.mkdir(parents=True, exist_ok=True)
+    project_cfg.write_text('{"schema_version": 99}', encoding="utf-8")
+
+    plan_file = repo / "plan.md"
+    _write_sample_plan(plan_file)
+
+    calls: list[tuple[str, str | None]] = []
+
+    async def fake_agent(prompt=None, schema=None, role=None, type_name="self", workspace="inherit", model=None):
+        calls.append((type_name, model))
+        if type_name == "paddock-verifier":
+            return {"verdict": "PASS", "summary": "ok", "evidence": [], "unverified": []}
+        return {"status": "DONE", "summary": "ok", "evidence": [], "unverified": []}
+
+    ns = _load_workflow_namespace(
+        {
+            "agent": fake_agent,
+            "WORKSPACES": (str(repo),),
+            "args": {"plan_path": "plan.md", "plugin_root": plugin_root},
+        }
+    )
+    assert ns["_workflow_summary"]["status"] == "PASS"
+    assert calls == [
+        ("paddock-implementer", "pro"),
+        ("paddock-verifier", "pro"),
+        ("paddock-generalist", "flash"),
+        ("paddock-verifier", "pro"),
+    ]
+
+    # Empty loader result also falls back cleanly to DEFAULT_MODELS via _drive_coro
+    loop_calls: list[tuple[str, str | None]] = []
+
+    async def fake_loop_agent(prompt=None, schema=None, role=None, type_name="self", workspace="inherit", model=None):
+        loop_calls.append((type_name, model))
+        if type_name == "paddock-verifier":
+            return {"verdict": "PASS", "summary": "ok", "evidence": [], "unverified": []}
+        return {"status": "DONE", "summary": "ok", "evidence": [], "unverified": []}
+
+    res = _drive_coro(
+        ns["run_build_loop"](
+            plan_file,
+            str(repo),
+            {},
+            agent_fn=fake_loop_agent,
+            trap_loader=lambda *a: [],
+            model_loader=lambda *a: {},
+        )
+    )
+    assert res["status"] == "PASS"
+    assert loop_calls == [
+        ("paddock-implementer", "pro"),
+        ("paddock-verifier", "pro"),
+        ("paddock-generalist", "flash"),
+        ("paddock-verifier", "pro"),
+    ]

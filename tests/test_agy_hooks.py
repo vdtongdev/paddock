@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from core.config import models
 from core.memory import memory
 from platforms.antigravity.scripts import agy_hooks
 
@@ -325,8 +326,9 @@ def test_plan_gate_approval_mtime_modes_utf8_and_overwrite(
     new_prompt = allow_ov["overwrite"]["Prompt"]
     assert agy_hooks.INJECTED_MARKER in new_prompt
     assert "app-trap" in new_prompt
+    assert allow_ov["overwrite"]["Model"] == "pro"
 
-    # Second call with marker already present does not double-inject
+    # Second call with marker already present does not double-inject Prompt, still injects standalone Model alias
     no_dup = _run_hook(
         "PreToolUse",
         {
@@ -340,7 +342,7 @@ def test_plan_gate_approval_mtime_modes_utf8_and_overwrite(
         },
         paddock_home,
     )
-    assert "overwrite" not in no_dup
+    assert no_dup == {"decision": "allow", "overwrite": {"Model": "pro"}}
 
 
 def test_stop_solo_and_fail_open(tmp_path: Path) -> None:
@@ -422,3 +424,428 @@ def test_stop_solo_and_fail_open(tmp_path: Path) -> None:
     # Garbage stdin fails open with exit 0
     fail_open = _run_hook("PreToolUse", "{not-json", paddock_home)
     assert fail_open == {"decision": "allow"}
+
+
+def test_session_start_antigravity_model_summary_and_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paddock_home = tmp_path / "paddock"
+    monkeypatch.setenv("PADDOCK_HOME", str(paddock_home))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    # Default balanced summary includes both swarm_model and subagent_alias
+    ss_default = _run_hook("SessionStart", {"hookEventName": "SessionStart", "cwd": str(repo)}, paddock_home)
+    msg_default = ss_default["injectSteps"][0]["systemMessage"]["systemMessage"]
+    assert "Paddock Antigravity models (swarm / subagent_alias):" in msg_default
+    assert "generalist=gemini-4-hydrogen-medium (flash)" in msg_default
+    assert "implementer=gemini-4-neon-medium (pro)" in msg_default
+    assert "verifier=gemini-4-neon-medium (pro)" in msg_default
+
+    # Global budget preset + project anthropic provider and effort override reflected in summary
+    models.set_preset("budget", scope="global", cwd=repo, home=paddock_home)
+    models.set_provider("antigravity", "anthropic", scope="project", cwd=repo, home=paddock_home)
+    models.set_role("implementer", "workhorse", effort="high", scope="project", cwd=repo, home=paddock_home)
+
+    # Large memory index entry triggers 19,500-char cap while preserving the models summary line
+    memory.write_entry(
+        repo,
+        "user",
+        "huge-pref",
+        "A" * 24000,
+        {"type": "user", "status": "active", "verified": "human", "verified_on": "2026-11-24"},
+        "Concise.\n",
+    )
+
+    ss_custom = _run_hook("SessionStart", {"hookEventName": "SessionStart", "cwd": str(repo)}, paddock_home)
+    msg_custom = ss_custom["injectSteps"][0]["systemMessage"]["systemMessage"]
+    assert len(msg_custom) <= agy_hooks.MAX_SESSION_MSG_CHARS
+    assert "...<truncated>" in msg_custom
+    assert "Paddock Antigravity models (swarm / subagent_alias):" in msg_custom
+    assert "generalist=gemini-4-hydrogen-medium (flash)" in msg_custom
+    assert "implementer=claude-sonnet-5-5-high (pro)" in msg_custom
+    assert "planner=claude-sonnet-5-5-low (pro)" in msg_custom
+    assert "verifier=gemini-4-hydrogen-high (flash)" in msg_custom
+
+
+def test_invoke_subagent_model_alias_injection_skip_and_preservation(tmp_path: Path) -> None:
+    paddock_home = tmp_path / "paddock"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    prompt_marked = f"Mode: quick fix a.py\n\n{agy_hooks.INJECTED_MARKER}\n{agy_hooks.VERIFY_RULES}"
+
+    # Balanced default: generalist -> flash, implementer ("inherit" or omitted) -> pro
+    gen_omitted = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "paddock-generalist", "Prompt": "Mode: lookup find foo"}},
+        },
+        paddock_home,
+    )
+    assert gen_omitted["decision"] == "allow"
+    assert gen_omitted["overwrite"]["Model"] == "flash"
+    assert agy_hooks.INJECTED_MARKER in gen_omitted["overwrite"]["Prompt"]
+
+    impl_inherit = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "paddock-implementer", "Prompt": prompt_marked, "Model": "inherit"},
+            },
+        },
+        paddock_home,
+    )
+    assert impl_inherit == {"decision": "allow", "overwrite": {"Model": "pro"}}
+
+    # Explicit caller Model values (e.g. "pro", "flash_lite") are preserved untouched
+    gen_explicit = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "paddock-generalist", "Prompt": prompt_marked, "Model": "pro"},
+            },
+        },
+        paddock_home,
+    )
+    assert gen_explicit == {"decision": "allow"}
+
+    impl_explicit = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "paddock-implementer", "Prompt": "Mode: quick fix a.py", "Model": "flash_lite"},
+            },
+        },
+        paddock_home,
+    )
+    assert impl_explicit["decision"] == "allow"
+    assert "Prompt" in impl_explicit["overwrite"]
+    assert "Model" not in impl_explicit["overwrite"]
+
+    # Quality preset resolves implementer to flagship -> subagent_alias="inherit" (skip Model overwrite)
+    models.set_preset("quality", scope="project", cwd=repo, home=paddock_home)
+    impl_quality = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "paddock-implementer", "Prompt": prompt_marked},
+            },
+        },
+        paddock_home,
+    )
+    assert impl_quality == {"decision": "allow"}
+
+    ui_quality = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "paddock-ui", "Prompt": prompt_marked, "Model": "inherit"},
+            },
+        },
+        paddock_home,
+    )
+    assert ui_quality == {"decision": "allow", "overwrite": {"Model": "pro"}}
+
+    # Explicit flash_lite override in models.json is injected verbatim
+    models.set_override("antigravity", "generalist", model="flash_lite", scope="project", cwd=repo, home=paddock_home)
+    gen_override = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "paddock-generalist", "Prompt": prompt_marked},
+            },
+        },
+        paddock_home,
+    )
+    assert gen_override == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+
+
+def test_swarm_add_model_injection_gates_traps_and_preservation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    paddock_home = tmp_path / "paddock"
+    monkeypatch.setenv("PADDOCK_HOME", str(paddock_home))
+    repo = tmp_path / "repo"
+    (repo / "docs" / "specs").mkdir(parents=True)
+    (repo / "docs" / "plans").mkdir(parents=True)
+
+    memory.write_entry(
+        repo,
+        "project",
+        "swarm-src-trap",
+        "Watch src/app.py",
+        {
+            "type": "project",
+            "trap": True,
+            "paths": ["src/**"],
+            "status": "active",
+            "verified": "human",
+            "verified_on": "2026-11-24",
+            "stale_after": "2027-05-24",
+        },
+        "**Symptom:** Race.\n**Cause:** Lock.\n**Do instead:** Serialize.\n",
+    )
+
+    spec_file = repo / "docs" / "specs" / "feat.md"
+    plan_file = repo / "docs" / "plans" / "feat.md"
+    spec_file.write_text("# Spec\n", encoding="utf-8")
+    plan_file.write_text("### Task 1\n- Agent: paddock-implementer\n- Files: src/app.py\n", encoding="utf-8")
+
+    t_user = datetime.datetime(2026, 11, 24, 10, 0, 0, tzinfo=datetime.timezone.utc)
+    t_future = t_user.timestamp() + 60.0
+    os.utime(spec_file, (t_future, t_future))
+    os.utime(plan_file, (t_future, t_future))
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        [{"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "created_at": t_user.isoformat().replace("+00:00", "Z"), "content": "check"}],
+    )
+
+    # Non-add actions and non-Paddock worker names are ignored cleanly
+    for action, name in (("list", "implementer"), ("status", "paddock-ui"), ("add", "helper"), ("add", "builder")):
+        ignored = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {"name": "swarm", "args": {"action": action, "name": name, "brief": "hello"}},
+            },
+            paddock_home,
+        )
+        assert ignored == {"decision": "allow"}
+
+    # plan-gate and Mode: git checks apply to swarm action="add" on Paddock workers
+    deny_missing = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "implementer-1", "brief": "fix src/app.py"}},
+        },
+        paddock_home,
+    )
+    assert deny_missing["decision"] == "deny" and "plan-gate" in deny_missing["reason"]
+
+    deny_plan_gate = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "paddock-implementer", "brief": "Run docs/plans/feat.md"}},
+        },
+        paddock_home,
+    )
+    assert deny_plan_gate["decision"] == "deny" and "Approval Gate 2" in deny_plan_gate["reason"]
+
+    deny_git = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "implementer", "brief": "Mode: git commit -m 'bad'"}},
+        },
+        paddock_home,
+    )
+    assert deny_git["decision"] == "deny" and "Mode: git" in deny_git["reason"]
+
+    # Balanced default: VERIFY_RULES + matched trap injected into brief and exact swarm_model set
+    bal_gen = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "generalist", "brief": "Mode: lookup read src/app.py"}},
+        },
+        paddock_home,
+    )
+    assert bal_gen["decision"] == "allow"
+    assert bal_gen["overwrite"]["model"] == "gemini-4-hydrogen-medium"
+    assert agy_hooks.INJECTED_MARKER in bal_gen["overwrite"]["brief"]
+    assert agy_hooks.VERIFY_RULES in bal_gen["overwrite"]["brief"]
+    assert "swarm-src-trap" in bal_gen["overwrite"]["brief"]
+
+    bal_ui = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "paddock-ui-2", "brief": "Mode: quick edit src/app.py"}},
+        },
+        paddock_home,
+    )
+    assert bal_ui["overwrite"]["model"] == "gemini-4-neon-medium"
+
+    # Explicit caller model is preserved untouched
+    explicit_swarm = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "implementer",
+                    "model": "claude-opus-5-5-high",
+                    "brief": bal_gen["overwrite"]["brief"],
+                },
+            },
+        },
+        paddock_home,
+    )
+    assert explicit_swarm == {"decision": "allow"}
+
+    explicit_with_brief = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {
+                "name": "swarm",
+                "args": {"action": "add", "name": "implementer", "model": "gemini-4-carbon-low", "brief": "Mode: quick fix src/app.py"},
+            },
+        },
+        paddock_home,
+    )
+    assert "brief" in explicit_with_brief["overwrite"]
+    assert "model" not in explicit_with_brief["overwrite"]
+
+    # Budget preset: implementer/verifier -> gemini-4-hydrogen-high, ui -> gemini-4-neon-low
+    models.set_preset("budget", scope="global", cwd=repo, home=paddock_home)
+    for worker, expected in (
+        ("implementer", "gemini-4-hydrogen-high"),
+        ("verifier-1", "gemini-4-hydrogen-high"),
+        ("ui", "gemini-4-neon-low"),
+    ):
+        res = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {"name": "swarm", "args": {"action": "add", "name": worker, "brief": f"Mode: quick {worker}"}},
+            },
+            paddock_home,
+        )
+        assert res["overwrite"]["model"] == expected
+
+    # Quality preset (Google Gemini 4): implementer -> gemini-4-carbon-medium, ui -> gemini-4-neon-high
+    models.set_preset("quality", scope="project", cwd=repo, home=paddock_home)
+    qual_impl = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "implementer", "brief": "Mode: quick run"}},
+        },
+        paddock_home,
+    )
+    assert qual_impl["overwrite"]["model"] == "gemini-4-carbon-medium"
+
+    qual_ui = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "ui", "brief": "Mode: quick style"}},
+        },
+        paddock_home,
+    )
+    assert qual_ui["overwrite"]["model"] == "gemini-4-neon-high"
+
+    # Anthropic provider overlay on quality preset: claude-opus-5-5-medium & claude-sonnet-5-5-high
+    models.set_provider("antigravity", "anthropic", scope="project", cwd=repo, home=paddock_home)
+    anth_impl = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "implementer", "brief": "Mode: quick run"}},
+        },
+        paddock_home,
+    )
+    assert anth_impl["overwrite"]["model"] == "claude-opus-5-5-medium"
+
+    anth_ui = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "ui", "brief": "Mode: quick style"}},
+        },
+        paddock_home,
+    )
+    assert anth_ui["overwrite"]["model"] == "claude-sonnet-5-5-high"
+
+
+def test_corrupt_models_json_fails_open_to_balanced(tmp_path: Path) -> None:
+    paddock_home = tmp_path / "paddock"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    global_cfg = models.config_path("global", repo, home=paddock_home)
+    global_cfg.parent.mkdir(parents=True, exist_ok=True)
+    global_cfg.write_text("{corrupt-json", encoding="utf-8")
+
+    project_cfg = models.config_path("project", repo, home=paddock_home)
+    project_cfg.parent.mkdir(parents=True, exist_ok=True)
+    project_cfg.write_text('{"schema_version": 99}', encoding="utf-8")
+
+    ss = _run_hook("SessionStart", {"hookEventName": "SessionStart", "cwd": str(repo)}, paddock_home)
+    msg = ss["injectSteps"][0]["systemMessage"]["systemMessage"]
+    assert "generalist=gemini-4-hydrogen-medium (flash)" in msg
+    assert "implementer=gemini-4-neon-medium (pro)" in msg
+
+    sub_gen = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {"name": "invoke_subagent", "args": {"TypeName": "paddock-generalist", "Prompt": "Mode: lookup x"}},
+        },
+        paddock_home,
+    )
+    assert sub_gen["overwrite"]["Model"] == "flash"
+
+    swarm_impl = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "toolCall": {"name": "swarm", "args": {"action": "add", "name": "implementer", "brief": "Mode: quick fix"}},
+        },
+        paddock_home,
+    )
+    assert swarm_impl["overwrite"]["model"] == "gemini-4-neon-medium"

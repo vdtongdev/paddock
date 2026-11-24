@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.12"
 # ///
-"""Sync platform-agnostic core skills and memory modules into platform adapters without symlinks."""
+"""Sync platform-agnostic core skills, config modules, and canonical agents into platform adapters."""
 
 from __future__ import annotations
 
@@ -11,7 +11,15 @@ from pathlib import Path
 import sys
 import tempfile
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from core.config import agents, models  # noqa: E402
+
 CORE_MEMORY_FILES = ("memory.py", "mcp_server.py")
+CORE_CONFIG_FILES = ("models.py", "agents.py")
 
 
 def _normalize_lf(data: bytes) -> bytes:
@@ -50,16 +58,35 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
         raise
 
 
-def _sync_file(src: Path, dst: Path, *, check: bool) -> str | None:
-    src_bytes = _read_normalized(src)
+def _sync_bytes(src_bytes: bytes, dst: Path, *, src_label: str, check: bool) -> str | None:
     if dst.is_file():
         dst_bytes = _read_normalized(dst)
         if dst_bytes == src_bytes:
             return None
     if check:
-        return f"drift: {dst} != {src}"
+        return f"drift: {dst} != {src_label}"
     _atomic_write_bytes(dst, src_bytes)
     return str(dst)
+
+
+def _sync_file(src: Path, dst: Path, *, check: bool) -> str | None:
+    return _sync_bytes(_read_normalized(src), dst, src_label=str(src), check=check)
+
+
+def _prune_stale_files(dst_dir: Path, expected_rels: set[Path], *, check: bool) -> list[str]:
+    findings: list[str] = []
+    if not dst_dir.is_dir():
+        return findings
+    for existing in sorted(dst_dir.rglob("*")):
+        if existing.is_file() and "__pycache__" not in existing.parts:
+            rel = existing.relative_to(dst_dir)
+            if rel not in expected_rels:
+                if check:
+                    findings.append(f"stale: {existing}")
+                else:
+                    existing.unlink()
+                    findings.append(f"removed:{existing}")
+    return findings
 
 
 def discover_platforms(repo_root: Path) -> list[Path]:
@@ -70,21 +97,38 @@ def discover_platforms(repo_root: Path) -> list[Path]:
 
 
 def sync_all(repo_root: Path, check: bool = False) -> list[str]:
-    """Sync `core/skills/*` and `core/memory/*` into every platform adapter.
+    """Sync `core/skills/*`, `core/memory/*`, `core/config/*`, and `core/agents/*` into platform adapters.
 
-    When `check=True`, returns a list of drift messages without modifying disk.
+    Compiles `core/agents/*.md` using built-in `balanced` defaults (never personal
+    `~/.paddock/models.json`) into `platforms/<plat>/agents/`.
+    When `check=True`, returns a list of drift/stale messages without modifying disk.
     When `check=False`, updates drifted/missing files and prunes stale files inside
-    synced directories, returning paths written/removed. Preserves `orchestrating/`.
+    synced skill and agent directories, returning paths written/removed. Preserves `orchestrating/`.
     """
     core_skills_dir = repo_root / "core" / "skills"
     core_mem_dir = repo_root / "core" / "memory"
+    core_cfg_dir = repo_root / "core" / "config"
+    core_agents_dir = repo_root / "core" / "agents"
     if not core_skills_dir.is_dir():
         raise FileNotFoundError(f"Missing core/skills directory: {core_skills_dir}")
+    if not core_agents_dir.is_dir():
+        raise FileNotFoundError(f"Missing core/agents directory: {core_agents_dir}")
 
     core_skills = [p for p in sorted(core_skills_dir.iterdir()) if p.is_dir()]
+    plat_dirs = discover_platforms(repo_root)
+    render_targets = [p.name for p in plat_dirs if p.name in agents.SUPPORTED_RENDER_PLATFORMS]
+    rendered_by_platform = (
+        agents.render_all_platforms(
+            core_agents_dir,
+            models.default_config(),
+            platforms=render_targets,
+        )
+        if render_targets
+        else {}
+    )
     changes: list[str] = []
 
-    for plat_dir in discover_platforms(repo_root):
+    for plat_dir in plat_dirs:
         plat_skills_dir = plat_dir / "skills"
         for src_skill in core_skills:
             dst_skill = plat_skills_dir / src_skill.name
@@ -98,24 +142,48 @@ def sync_all(repo_root: Path, check: bool = False) -> list[str]:
                 if msg:
                     changes.append(msg)
 
-            if dst_skill.is_dir():
-                for existing in sorted(dst_skill.rglob("*")):
-                    if existing.is_file() and "__pycache__" not in existing.parts:
-                        rel = existing.relative_to(dst_skill)
-                        if rel not in expected_rels:
-                            if check:
-                                changes.append(f"stale: {existing}")
-                            else:
-                                existing.unlink()
-                                changes.append(f"removed:{existing}")
+            changes.extend(_prune_stale_files(dst_skill, expected_rels, check=check))
 
         paddock_core_dst = plat_dir / "scripts" / "paddock_core"
-        for fname in CORE_MEMORY_FILES:
-            src_mem = core_mem_dir / fname
-            if src_mem.is_file():
-                msg = _sync_file(src_mem, paddock_core_dst / fname, check=check)
+        for src_dir, filenames in (
+            (core_mem_dir, CORE_MEMORY_FILES),
+            (core_cfg_dir, CORE_CONFIG_FILES),
+        ):
+            for fname in filenames:
+                src_file = src_dir / fname
+                if src_file.is_file():
+                    msg = _sync_file(src_file, paddock_core_dst / fname, check=check)
+                    if msg:
+                        changes.append(msg)
+
+        paddock_core_agents_dst = paddock_core_dst / "agents"
+        expected_core_agent_rels: set[Path] = set()
+        for src_agent in sorted(core_agents_dir.glob("*.md")):
+            if not src_agent.is_file():
+                continue
+            rel = Path(src_agent.name)
+            expected_core_agent_rels.add(rel)
+            msg = _sync_file(src_agent, paddock_core_agents_dst / rel, check=check)
+            if msg:
+                changes.append(msg)
+        changes.extend(_prune_stale_files(paddock_core_agents_dst, expected_core_agent_rels, check=check))
+
+        if plat_dir.name in rendered_by_platform:
+            plat_agents_dst = plat_dir / "agents"
+            expected_rendered_rels: set[Path] = set()
+            for fname, content in sorted(rendered_by_platform[plat_dir.name].items()):
+                rel = Path(fname)
+                expected_rendered_rels.add(rel)
+                canonical_name = fname.removeprefix("paddock-")
+                msg = _sync_bytes(
+                    _normalize_lf(content.encode("utf-8")),
+                    plat_agents_dst / rel,
+                    src_label=f"{core_agents_dir / canonical_name} (balanced)",
+                    check=check,
+                )
                 if msg:
                     changes.append(msg)
+            changes.extend(_prune_stale_files(plat_agents_dst, expected_rendered_rels, check=check))
 
     return changes
 
