@@ -39,11 +39,11 @@ VERDICT_SCHEMA = {
 }
 
 DEFAULT_MODELS: dict[str, str] = {
-    "paddock-generalist": "flash_lite",
-    "paddock-implementer": "flash",
-    "paddock-ui": "flash",
-    "paddock-planner": "flash",
-    "paddock-verifier": "flash",
+    "paddock-generalist": "flash",
+    "paddock-implementer": "pro",
+    "paddock-ui": "pro",
+    "paddock-planner": "pro",
+    "paddock-verifier": "pro",
 }
 
 ROLE_MAP: dict[str, str] = {
@@ -114,17 +114,23 @@ def parse_plan(text: str) -> list[dict[str, Any]]:
     return tasks
 
 
-def load_traps_for_task(cwd: str, files: list[str], args_dict: dict[str, Any]) -> list[dict[str, Any]]:
-    """Load matching trap entries via memory.py using explicit workspace/plugin roots."""
+def _candidate_paddock_files(
+    cwd: str, args_dict: dict[str, Any], repo_rel: Path, core_filename: str
+) -> list[Path]:
     candidates: list[Path] = []
     plugin_root = args_dict.get("plugin_root")
     if isinstance(plugin_root, str) and plugin_root.strip():
-        candidates.append(Path(plugin_root) / "scripts" / "paddock_core" / "memory.py")
-    candidates.append(Path(cwd) / "core" / "memory" / "memory.py")
+        candidates.append(Path(plugin_root) / "scripts" / "paddock_core" / core_filename)
+    candidates.append(Path(cwd) / repo_rel / core_filename)
     candidates.append(
-        Path.home() / ".gemini" / "config" / "plugins" / "paddock" / "scripts" / "paddock_core" / "memory.py"
+        Path.home() / ".gemini" / "config" / "plugins" / "paddock" / "scripts" / "paddock_core" / core_filename
     )
-    for cand in candidates:
+    return candidates
+
+
+def load_traps_for_task(cwd: str, files: list[str], args_dict: dict[str, Any]) -> list[dict[str, Any]]:
+    """Load matching trap entries via memory.py using explicit workspace/plugin roots."""
+    for cand in _candidate_paddock_files(cwd, args_dict, Path("core") / "memory", "memory.py"):
         if cand.is_file():
             try:
                 spec = importlib.util.spec_from_file_location("paddock_workflow_memory", cand)
@@ -136,6 +142,58 @@ def load_traps_for_task(cwd: str, files: list[str], args_dict: dict[str, Any]) -
             except Exception:
                 return []
     return []
+
+
+def load_models_for_workflow(cwd: str, args_dict: dict[str, Any]) -> dict[str, str]:
+    """Load `models.py` and resolve Antigravity `subagent_alias` per role, failing open to DEFAULT_MODELS."""
+    models = dict(DEFAULT_MODELS)
+    for cand in _candidate_paddock_files(cwd, args_dict, Path("core") / "config", "models.py"):
+        if not cand.is_file():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("paddock_workflow_models", cand)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                resolved = mod.resolve_platform("antigravity", cwd)
+                if isinstance(resolved, dict):
+                    for role in ("generalist", "implementer", "ui", "planner", "verifier"):
+                        entry = resolved.get(role)
+                        if not isinstance(entry, dict):
+                            continue
+                        alias = entry.get("subagent_alias")
+                        if not isinstance(alias, str) or not alias:
+                            alias = mod.antigravity_subagent_alias(
+                                entry.get("model"),
+                                tier=entry.get("tier"),
+                            )
+                        if isinstance(alias, str) and alias:
+                            models[f"paddock-{role}"] = alias
+                    return models
+        except Exception:
+            continue
+    return models
+
+
+def _resolve_build_models(
+    cwd: str,
+    args_dict: dict[str, Any],
+    model_loader: Callable[[str, dict[str, Any]], dict[str, str]],
+) -> dict[str, str]:
+    models = dict(DEFAULT_MODELS)
+    loaded = model_loader(cwd, args_dict)
+    if isinstance(loaded, dict):
+        for raw_key, raw_val in loaded.items():
+            if isinstance(raw_val, str) and raw_val.strip():
+                key_str = str(raw_key).strip()
+                models[ROLE_MAP.get(key_str.lower(), key_str)] = raw_val.strip()
+    if isinstance(args_dict.get("models"), dict):
+        for raw_key, raw_val in args_dict["models"].items():
+            if raw_val is None or not str(raw_val).strip():
+                continue
+            key_str = str(raw_key).strip()
+            models[ROLE_MAP.get(key_str.lower(), key_str)] = str(raw_val).strip()
+    return models
 
 
 def _format_traps_text(traps: list[dict[str, Any]]) -> str:
@@ -197,11 +255,10 @@ async def run_build_loop(
     phase_fn: Callable[[str], Any] | None = None,
     log_fn: Callable[..., Any] | None = None,
     trap_loader: Callable[[str, list[str], dict[str, Any]], list[dict[str, Any]]] = load_traps_for_task,
+    model_loader: Callable[[str, dict[str, Any]], dict[str, str]] = load_models_for_workflow,
 ) -> dict[str, Any]:
     """Execute an approved plan with deterministic routing, retry caps, and DISPUTE limits."""
-    models = dict(DEFAULT_MODELS)
-    if isinstance(args_dict.get("models"), dict):
-        models.update({str(k): str(v) for k, v in args_dict["models"].items()})
+    models = _resolve_build_models(cwd, args_dict, model_loader)
     workspace_mode = str(args_dict.get("workspace") or "inherit")
 
     plan_text = plan_path.read_text(encoding="utf-8")
@@ -235,7 +292,7 @@ async def run_build_loop(
                 role=f"Revise {task['title']}",
                 type_name="paddock-planner",
                 workspace=workspace_mode,
-                model=models.get("paddock-planner", "flash"),
+                model=models.get("paddock-planner", DEFAULT_MODELS["paddock-planner"]),
             )
             refreshed = parse_plan(plan_path.read_text(encoding="utf-8"))
             if idx < len(refreshed):
@@ -253,7 +310,7 @@ async def run_build_loop(
                 role=task["title"],
                 type_name=task["agent"],
                 workspace=workspace_mode,
-                model=models.get(task["agent"], "flash"),
+                model=models.get(task["agent"], DEFAULT_MODELS.get(task["agent"], "pro")),
             )
             w_status = worker_res.get("status", "")
 
@@ -314,7 +371,7 @@ async def run_build_loop(
                 role=f"Verify {task['title']}",
                 type_name="paddock-verifier",
                 workspace=workspace_mode,
-                model=models.get("paddock-verifier", "flash"),
+                model=models.get("paddock-verifier", DEFAULT_MODELS["paddock-verifier"]),
             )
             verdict = verifier_res.get("verdict")
             v_reason = str(verifier_res.get("reason") or verifier_res.get("summary") or "")
@@ -357,7 +414,7 @@ async def run_build_loop(
                         role=f"Verify rerun {task['title']}",
                         type_name="paddock-verifier",
                         workspace=workspace_mode,
-                        model=models.get("paddock-verifier", "flash"),
+                        model=models.get("paddock-verifier", DEFAULT_MODELS["paddock-verifier"]),
                     )
                     if rerun_res.get("verdict") == "PASS":
                         completed.append(

@@ -15,27 +15,35 @@ import sys
 from typing import Any
 
 
-def _import_memory():
+def _import_core_module(module_name: str, repo_subdir: Path):
     here = Path(__file__).resolve().parent
-    for cand in (here / "paddock_core", here.parents[2] / "core" / "memory"):
-        if (cand / "memory.py").is_file():
+    for cand in (here / "paddock_core", here.parents[2] / repo_subdir):
+        if (cand / f"{module_name}.py").is_file():
             if str(cand) not in sys.path:
                 sys.path.insert(0, str(cand))
-            import memory  # type: ignore[import-not-found]
-
-            return memory
-    raise ImportError("Unable to locate Paddock memory.py")
+            return __import__(module_name)
+    raise ImportError(f"Unable to locate Paddock {module_name}.py")
 
 
-memory = _import_memory()
+memory = _import_core_module("memory", Path("core") / "memory")
+try:
+    models = _import_core_module("models", Path("core") / "config")
+except ImportError:
+    models = None
 
-PADDOCK_AGENTS = {
-    "paddock-generalist",
-    "paddock-implementer",
-    "paddock-ui",
-    "paddock-planner",
-    "paddock-verifier",
+AGY_ROLES: tuple[str, ...] = ("generalist", "implementer", "ui", "planner", "verifier")
+PADDOCK_AGENTS = {f"paddock-{role}" for role in AGY_ROLES}
+DEFAULT_AGY_MODELS: dict[str, dict[str, str]] = {
+    "generalist": {"swarm_model": "gemini-4-hydrogen-medium", "subagent_alias": "flash"},
+    "implementer": {"swarm_model": "gemini-4-neon-medium", "subagent_alias": "pro"},
+    "ui": {"swarm_model": "gemini-4-neon-medium", "subagent_alias": "pro"},
+    "planner": {"swarm_model": "gemini-4-neon-medium", "subagent_alias": "pro"},
+    "verifier": {"swarm_model": "gemini-4-neon-medium", "subagent_alias": "pro"},
 }
+SWARM_WORKER_RE = re.compile(
+    r"^(?:paddock-)?(generalist|implementer|ui|planner|verifier)(?:-[A-Za-z0-9]+)?$",
+    re.IGNORECASE,
+)
 INJECTED_MARKER = "<!-- paddock:injected -->"
 VERIFY_RULES = (
     "PADDOCK VERIFICATION CONTRACT:\n"
@@ -208,6 +216,57 @@ def _format_traps_block(cwd: Path, paths: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _resolve_antigravity_models(cwd: Path) -> dict[str, dict[str, str]]:
+    resolved: dict[str, dict[str, str]] = {r: dict(v) for r, v in DEFAULT_AGY_MODELS.items()}
+    if models is None:
+        return resolved
+    try:
+        plat_map = models.resolve_platform("antigravity", cwd)
+        if isinstance(plat_map, dict):
+            for role in AGY_ROLES:
+                entry = plat_map.get(role)
+                if not isinstance(entry, dict):
+                    continue
+                swarm_model = entry.get("swarm_model")
+                subagent_alias = entry.get("subagent_alias")
+                if isinstance(swarm_model, str) and swarm_model:
+                    resolved[role]["swarm_model"] = swarm_model
+                if isinstance(subagent_alias, str) and subagent_alias:
+                    resolved[role]["subagent_alias"] = subagent_alias
+    except Exception as exc:
+        print(f"[paddock agy_hooks fail-open] models resolve failed: {exc}", file=sys.stderr)
+    return resolved
+
+
+def _resolve_antigravity_role(cwd: Path, role: str) -> dict[str, str]:
+    fallback = dict(
+        DEFAULT_AGY_MODELS.get(role, {"swarm_model": "gemini-4-neon-medium", "subagent_alias": "pro"})
+    )
+    if models is None:
+        return fallback
+    try:
+        entry = models.resolve_role("antigravity", role, cwd)
+        if isinstance(entry, dict):
+            swarm_model = entry.get("swarm_model")
+            subagent_alias = entry.get("subagent_alias")
+            if isinstance(swarm_model, str) and swarm_model:
+                fallback["swarm_model"] = swarm_model
+            if isinstance(subagent_alias, str) and subagent_alias:
+                fallback["subagent_alias"] = subagent_alias
+    except Exception as exc:
+        print(f"[paddock agy_hooks fail-open] role '{role}' resolve failed: {exc}", file=sys.stderr)
+    return fallback
+
+
+def _format_session_models_line(cwd: Path) -> str:
+    resolved = _resolve_antigravity_models(cwd)
+    parts = [
+        f"{role}={resolved[role]['swarm_model']} ({resolved[role]['subagent_alias']})"
+        for role in AGY_ROLES
+    ]
+    return "Paddock Antigravity models (swarm / subagent_alias): " + ", ".join(parts)
+
+
 def handle_session_start(payload: dict[str, Any]) -> dict[str, Any]:
     cwd = _resolve_cwd(payload)
     idx = memory.index(cwd)
@@ -237,10 +296,18 @@ def handle_session_start(payload: dict[str, Any]) -> dict[str, Any]:
         if capped:
             sections.append(f"### Memory Validation Problems\n{capped}")
 
-    if not sections:
-        return {"injectSteps": []}
+    models_line = _format_session_models_line(cwd)
+    body = "\n\n".join(sections)
+    if body:
+        budget = MAX_SESSION_MSG_CHARS - len(models_line) - 2
+        if len(body) > budget:
+            trunc_marker = "\n...<truncated>"
+            keep = max(0, budget - len(trunc_marker))
+            body = body[:keep] + trunc_marker
+        full = f"{body}\n\n{models_line}"
+    else:
+        full = models_line
 
-    full = "\n\n".join(sections)
     if len(full) > MAX_SESSION_MSG_CHARS:
         full = full[: MAX_SESSION_MSG_CHARS - 20] + "\n...<truncated>"
     return {"injectSteps": [{"systemMessage": {"systemMessage": full}}]}
@@ -308,6 +375,62 @@ def _handle_run_workflow_gate(cwd: Path, args: dict[str, Any], last_user_ts: flo
     return {"decision": "allow"}
 
 
+def _extract_swarm_role(name: str) -> str | None:
+    match = SWARM_WORKER_RE.fullmatch(name.strip())
+    if not match:
+        return None
+    return match.group(1).lower()
+
+
+def _validate_worker_dispatch(
+    cwd: Path,
+    role: str,
+    text: str,
+    last_user_ts: float | None,
+    *,
+    field_label: str,
+) -> str | None:
+    if role == "planner":
+        spec_file = _resolve_doc_ref(cwd, text, "specs")
+        plan_file = _resolve_doc_ref(cwd, text, "plans")
+        if spec_file is not None:
+            if not spec_file.is_file():
+                return f"Paddock plan-gate: referenced spec does not exist: {spec_file}"
+            return _check_approval_gate(spec_file, last_user_ts, "Approval Gate 1")
+        if plan_file is None or not plan_file.is_file():
+            return (
+                "Paddock plan-gate: paddock-planner requires an approved "
+                "docs/specs/<file>.md (or existing plan to revise)."
+            )
+        return None
+
+    mode_match = MODE_RE.search(text)
+    plan_file = _resolve_doc_ref(cwd, text, "plans")
+    if not mode_match and plan_file is None:
+        return (
+            "Paddock plan-gate: specify 'Mode: quick|diagnose|git|lookup' "
+            f"or name an approved docs/plans/<file>.md in {field_label}."
+        )
+    if plan_file is not None and not mode_match:
+        err = _validate_plan_file(plan_file, last_user_ts)
+        if err:
+            return err
+    if mode_match and mode_match.group(1).lower() == "git":
+        return _validate_git_mode(text)
+    return None
+
+
+def _build_injected_text(cwd: Path, text: str) -> str | None:
+    if INJECTED_MARKER in text:
+        return None
+    paths = _extract_path_candidates(text)
+    traps_block = _format_traps_block(cwd, paths)
+    injected = f"{INJECTED_MARKER}\n{VERIFY_RULES}"
+    if traps_block:
+        injected += f"\n\n{traps_block}"
+    return f"{text}\n\n{injected}"
+
+
 def _handle_invoke_subagent_gate(
     cwd: Path, args: dict[str, Any], last_user_ts: float | None
 ) -> dict[str, Any]:
@@ -315,57 +438,60 @@ def _handle_invoke_subagent_gate(
     if type_name not in PADDOCK_AGENTS:
         return {"decision": "allow"}
 
+    role = type_name.removeprefix("paddock-")
     prompt = str(args.get("Prompt") or "")
+    err = _validate_worker_dispatch(cwd, role, prompt, last_user_ts, field_label="Prompt")
+    if err:
+        return {"decision": "deny", "reason": err}
 
-    if type_name == "paddock-planner":
-        spec_file = _resolve_doc_ref(cwd, prompt, "specs")
-        plan_file = _resolve_doc_ref(cwd, prompt, "plans")
-        if spec_file is not None:
-            if not spec_file.is_file():
-                return {
-                    "decision": "deny",
-                    "reason": f"Paddock plan-gate: referenced spec does not exist: {spec_file}",
-                }
-            gate_err = _check_approval_gate(spec_file, last_user_ts, "Approval Gate 1")
-            if gate_err:
-                return {"decision": "deny", "reason": gate_err}
-        elif plan_file is None or not plan_file.is_file():
-            return {
-                "decision": "deny",
-                "reason": "Paddock plan-gate: paddock-planner requires an approved docs/specs/<file>.md (or existing plan to revise).",
-            }
-    else:
-        mode_match = MODE_RE.search(prompt)
-        plan_file = _resolve_doc_ref(cwd, prompt, "plans")
-        if not mode_match and plan_file is None:
-            return {
-                "decision": "deny",
-                "reason": (
-                    "Paddock plan-gate: specify 'Mode: quick|diagnose|git|lookup' "
-                    "or name an approved docs/plans/<file>.md in Prompt."
-                ),
-            }
-        if plan_file is not None and not mode_match:
-            err = _validate_plan_file(plan_file, last_user_ts)
-            if err:
-                return {"decision": "deny", "reason": err}
-        if mode_match and mode_match.group(1).lower() == "git":
-            git_err = _validate_git_mode(prompt)
-            if git_err:
-                return {"decision": "deny", "reason": git_err}
+    overwrite: dict[str, Any] = {}
+    new_prompt = _build_injected_text(cwd, prompt)
+    if new_prompt is not None:
+        overwrite["Prompt"] = new_prompt
 
-    if INJECTED_MARKER in prompt:
+    raw_model = args.get("Model")
+    caller_model = raw_model.strip() if isinstance(raw_model, str) else ""
+    if caller_model in ("", "inherit"):
+        alias = _resolve_antigravity_role(cwd, role).get("subagent_alias")
+        if isinstance(alias, str) and alias and alias != "inherit":
+            overwrite["Model"] = alias
+
+    if overwrite:
+        return {"decision": "allow", "overwrite": overwrite}
+    return {"decision": "allow"}
+
+
+def _handle_swarm_gate(
+    cwd: Path, args: dict[str, Any], last_user_ts: float | None
+) -> dict[str, Any]:
+    action = str(args.get("action") or "").strip().lower()
+    if action != "add":
         return {"decision": "allow"}
 
-    paths = _extract_path_candidates(prompt)
-    traps_block = _format_traps_block(cwd, paths)
-    injected = f"{INJECTED_MARKER}\n{VERIFY_RULES}"
-    if traps_block:
-        injected += f"\n\n{traps_block}"
-    return {
-        "decision": "allow",
-        "overwrite": {"Prompt": f"{prompt}\n\n{injected}"},
-    }
+    role = _extract_swarm_role(str(args.get("name") or ""))
+    if role is None:
+        return {"decision": "allow"}
+
+    brief = str(args.get("brief") or "")
+    err = _validate_worker_dispatch(cwd, role, brief, last_user_ts, field_label="brief")
+    if err:
+        return {"decision": "deny", "reason": err}
+
+    overwrite: dict[str, Any] = {}
+    new_brief = _build_injected_text(cwd, brief)
+    if new_brief is not None:
+        overwrite["brief"] = new_brief
+
+    raw_model = args.get("model")
+    caller_model = raw_model.strip() if isinstance(raw_model, str) else ""
+    if not caller_model:
+        swarm_model = _resolve_antigravity_role(cwd, role).get("swarm_model")
+        if isinstance(swarm_model, str) and swarm_model:
+            overwrite["model"] = swarm_model
+
+    if overwrite:
+        return {"decision": "allow", "overwrite": overwrite}
+    return {"decision": "allow"}
 
 
 def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
@@ -385,6 +511,8 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         return _handle_run_workflow_gate(cwd, args, last_user_ts)
     if tool_name == "invoke_subagent":
         return _handle_invoke_subagent_gate(cwd, args, last_user_ts)
+    if tool_name == "swarm":
+        return _handle_swarm_gate(cwd, args, last_user_ts)
 
     return {"decision": "allow"}
 

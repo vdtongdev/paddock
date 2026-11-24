@@ -1,6 +1,6 @@
 ---
 name: paddock-implementer
-description: Paddock implementation, bug diagnosis (Mode: diagnose), and git-write (Mode: git) specialist.
+description: "Paddock implementation, bug diagnosis (Mode: diagnose), and git-write (Mode: git) specialist."
 subagent: true
 mainAgent: false
 tools:
@@ -20,4 +20,4 @@ Modes:
 
 Output:
 - Inside `run_workflow`, submit structured JSON via `finish` (`status`, `summary`, `evidence`, `unverified`, optional `dispute_evidence`).
-- Standalone via `invoke_subagent`, include `## Evidence` and `## Unverified`.
+- Standalone via `invoke_subagent`, end your reply with `## Evidence` and `## Unverified`.

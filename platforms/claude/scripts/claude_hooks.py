@@ -15,23 +15,41 @@ import time
 from typing import Any
 
 
-def _import_memory():
+def _import_core_module(module_name: str, repo_subdir: Path):
+    """Import a Paddock core module from sibling `paddock_core/` or repo `core/`."""
     here = Path(__file__).resolve().parent
-    for cand in (here / "paddock_core", here.parents[2] / "core" / "memory"):
-        if (cand / "memory.py").is_file():
+    candidates = [here / "paddock_core"]
+    if len(here.parents) >= 3:
+        candidates.append(here.parents[2] / repo_subdir)
+    for cand in candidates:
+        if (cand / f"{module_name}.py").is_file():
             if str(cand) not in sys.path:
                 sys.path.insert(0, str(cand))
-            import memory  # type: ignore[import-not-found]
-
-            return memory
-    raise ImportError("Unable to locate Paddock memory.py")
+            return __import__(module_name)
+    raise ImportError(f"Unable to locate Paddock {module_name}.py")
 
 
-memory = _import_memory()
+memory = _import_core_module("memory", Path("core") / "memory")
+try:
+    models = _import_core_module("models", Path("core") / "config")
+except Exception as exc:
+    print(f"[paddock claude_hooks fail-open] models import failed: {exc}", file=sys.stderr)
+    models = None
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 SEARCH_TOOLS = {"Grep", "Glob", "WebFetch", "WebSearch"}
-PADDOCK_ROLES = {"generalist", "implementer", "ui", "planner", "builder", "verifier"}
+CLAUDE_ROLES: tuple[str, ...] = ("generalist", "implementer", "ui", "planner", "builder", "verifier")
+PADDOCK_ROLES = set(CLAUDE_ROLES)
+DEFAULT_CLAUDE_MODELS: dict[str, dict[str, str]] = {
+    "generalist": {"model": "haiku", "effort": "medium"},
+    "implementer": {"model": "sonnet", "effort": "medium"},
+    "ui": {"model": "sonnet", "effort": "medium"},
+    "planner": {"model": "sonnet", "effort": "medium"},
+    "builder": {"model": "sonnet", "effort": "medium"},
+    "verifier": {"model": "sonnet", "effort": "medium"},
+}
+CLAUDE_MODEL_RE = re.compile(r"\A[a-z0-9][a-z0-9._-]{1,63}\Z")
+CLAUDE_EFFORTS = frozenset({"low", "medium", "high"})
 
 SPEC_REF_RE = re.compile(r"docs[/\\]specs[/\\]([A-Za-z0-9._-]+\.md)")
 PLAN_REF_RE = re.compile(r"docs[/\\]plans[/\\]([A-Za-z0-9._-]+\.md)")
@@ -185,6 +203,267 @@ def _normalize_role(subagent_type: str) -> str:
     return subagent_type.split(":")[-1].strip().lower()
 
 
+def _is_symlink_or_junction(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    return bool(callable(is_junction) and is_junction())
+
+
+def _strip_yaml_inline_comment(raw: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for idx, ch in enumerate(raw):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_double:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == "#" and not in_single and not in_double:
+            if idx == 0 or raw[idx - 1].isspace():
+                return raw[:idx].rstrip()
+    return raw.rstrip()
+
+
+def _unquote_yaml_scalar(raw: str) -> str:
+    val = _strip_yaml_inline_comment(raw).strip()
+    if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+        inner = val[1:-1]
+        if val[0] == "'":
+            return inner.replace("''", "'")
+        return inner.replace('\\"', '"').replace("\\\\", "\\")
+    return val
+
+
+def _static_claude_agents_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "agents"
+
+
+def _read_static_claude_agent_model(role: str) -> dict[str, str]:
+    """Safely read static `model` and `effort` from `agents/<role>.md` frontmatter."""
+    fallback = dict(DEFAULT_CLAUDE_MODELS.get(role, {"model": "sonnet", "effort": "medium"}))
+    agents_dir = _static_claude_agents_dir()
+    try:
+        if _is_symlink_or_junction(agents_dir) or not agents_dir.is_dir():
+            return fallback
+        resolved_dir = agents_dir.resolve()
+        agent_file = agents_dir / f"{role}.md"
+        if _is_symlink_or_junction(agent_file) or not agent_file.is_file():
+            return fallback
+        resolved_file = agent_file.resolve()
+        if resolved_file.parent != resolved_dir or resolved_file.name != f"{role}.md":
+            print(
+                f"[paddock claude_hooks fail-open] unsafe agent profile path: {agent_file}",
+                file=sys.stderr,
+            )
+            return fallback
+
+        text = resolved_file.read_text(encoding="utf-8", errors="replace")
+        normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+        lines = normalized.split("\n")
+        if not lines or lines[0].strip() != "---":
+            return fallback
+        end_idx: int | None = None
+        for idx in range(1, len(lines)):
+            if lines[idx].strip() == "---":
+                end_idx = idx
+                break
+        if end_idx is None:
+            return fallback
+
+        parsed_model: str | None = None
+        parsed_effort: str | None = None
+        for raw_line in lines[1:end_idx]:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#") or raw_line.startswith((" ", "\t")):
+                continue
+            if ":" not in stripped:
+                continue
+            key, rest = stripped.split(":", 1)
+            key = key.strip()
+            if key == "model":
+                parsed_model = _unquote_yaml_scalar(rest)
+            elif key == "effort":
+                parsed_effort = _unquote_yaml_scalar(rest)
+
+        if parsed_model:
+            if models is not None:
+                clean_model, _ = models.validate_model_id("claude", parsed_model, None)
+            elif CLAUDE_MODEL_RE.fullmatch(parsed_model):
+                clean_model = parsed_model
+            else:
+                raise ValueError(f"Invalid static claude model {parsed_model!r}")
+            fallback["model"] = clean_model
+        if parsed_effort:
+            if models is not None:
+                fallback["effort"] = models.validate_effort(parsed_effort)
+            elif parsed_effort in CLAUDE_EFFORTS:
+                fallback["effort"] = parsed_effort
+            else:
+                raise ValueError(f"Invalid static claude effort {parsed_effort!r}")
+    except Exception as exc:
+        print(
+            f"[paddock claude_hooks fail-open] ignoring invalid static profile for {role}: {exc}",
+            file=sys.stderr,
+        )
+    return fallback
+
+
+def _compute_role_model_entry(
+    role: str,
+    cwd: Path,
+    global_cfg: dict[str, Any] | None,
+    project_cfg: dict[str, Any] | None,
+    static_profile: dict[str, str],
+) -> dict[str, Any]:
+    fallback_def = DEFAULT_CLAUDE_MODELS.get(role, {"model": "sonnet", "effort": "medium"})
+    entry: dict[str, Any] = {
+        "model": fallback_def["model"],
+        "effort": fallback_def["effort"],
+        "source": "default",
+        "static_model": static_profile["model"],
+        "static_effort": static_profile["effort"],
+        "project_mismatch": False,
+        "project_source": "default",
+    }
+    if models is None:
+        return entry
+
+    eff_res = models.resolve_role(
+        "claude",
+        role,
+        cwd,
+        global_cfg=global_cfg or {},
+        project_cfg=project_cfg or {},
+        _layers_loaded=True,
+    )
+    eff_model = str(eff_res.get("model") or fallback_def["model"])
+    eff_effort = str(eff_res.get("effort") or fallback_def["effort"])
+    eff_source = str(eff_res.get("source") or "default")
+
+    entry["model"] = eff_model
+    entry["effort"] = eff_effort
+    entry["source"] = eff_source
+
+    if project_cfg:
+        glob_res = models.resolve_role(
+            "claude",
+            role,
+            cwd,
+            global_cfg=global_cfg or {},
+            project_cfg={},
+            _layers_loaded=True,
+        )
+        glob_model = str(glob_res.get("model") or fallback_def["model"])
+        glob_effort = str(glob_res.get("effort") or fallback_def["effort"])
+
+        project_affected = eff_source.startswith("project-") or (
+            (eff_model, eff_effort) != (glob_model, glob_effort)
+        )
+        differs_from_static = (eff_model, eff_effort) != (
+            static_profile["model"],
+            static_profile["effort"],
+        )
+        if project_affected and differs_from_static:
+            entry["project_mismatch"] = True
+            entry["project_source"] = (
+                eff_source if eff_source.startswith("project-") else "project-config"
+            )
+    return entry
+
+
+def _resolve_claude_model_state(
+    cwd: Path,
+    roles: tuple[str, ...] = CLAUDE_ROLES,
+) -> dict[str, dict[str, Any]]:
+    """Resolve effective Claude models and project-vs-static mismatches, failing open to balanced."""
+    static_profiles = {role: _read_static_claude_agent_model(role) for role in roles}
+    state: dict[str, dict[str, Any]] = {}
+    for role in roles:
+        fallback_def = DEFAULT_CLAUDE_MODELS.get(role, {"model": "sonnet", "effort": "medium"})
+        static_profile = static_profiles[role]
+        state[role] = {
+            "model": fallback_def["model"],
+            "effort": fallback_def["effort"],
+            "source": "default",
+            "static_model": static_profile["model"],
+            "static_effort": static_profile["effort"],
+            "project_mismatch": False,
+            "project_source": "default",
+        }
+    if models is None:
+        return state
+    try:
+        global_cfg = models.load_config_layer("global", cwd)
+        project_cfg = models.load_config_layer("project", cwd)
+        for role in roles:
+            state[role] = _compute_role_model_entry(
+                role,
+                cwd,
+                global_cfg,
+                project_cfg,
+                static_profiles[role],
+            )
+    except Exception as exc:
+        print(f"[paddock claude_hooks fail-open] models resolve failed: {exc}", file=sys.stderr)
+    return state
+
+
+def _format_session_models_section(cwd: Path) -> str:
+    """Format Claude role `model/effort` summary and project-vs-static mismatch flags."""
+    resolved = _resolve_claude_model_state(cwd)
+    summary = ", ".join(
+        f"{role}={resolved[role]['model']}/{resolved[role]['effort']}"
+        for role in CLAUDE_ROLES
+    )
+    lines = ["### Paddock Claude Models", summary]
+    mismatches = [
+        (role, resolved[role])
+        for role in CLAUDE_ROLES
+        if resolved[role].get("project_mismatch")
+    ]
+    if mismatches:
+        lines.append("Project overrides differing from installed static frontmatter:")
+        for role, info in mismatches:
+            lines.append(
+                f"- {role}: resolved {info['model']}/{info['effort']} ({info['project_source']}) "
+                f"vs static frontmatter {info['static_model']}/{info['static_effort']} "
+                f"(pass `model=\"{info['model']}\"` on `Agent` if supported; static profiles reflect global config)"
+            )
+    return "\n".join(lines)
+
+
+def _project_model_mismatch_note(cwd: Path, role: str) -> str | None:
+    """Return non-blocking context note if project models.json differs from static frontmatter."""
+    info = _resolve_claude_model_state(cwd, roles=(role,)).get(role)
+    if not info or not info.get("project_mismatch"):
+        return None
+    eff_model = info["model"]
+    eff_effort = info["effort"]
+    static_model = info["static_model"]
+    static_effort = info["static_effort"]
+    source = info["project_source"]
+    if eff_model != static_model:
+        return (
+            f"Paddock project model override for `{role}` ({source}): resolved `{eff_model}/{eff_effort}` "
+            f"differs from static agent frontmatter `{static_model}/{static_effort}`. "
+            f"Pass `model: \"{eff_model}\"` when calling `Agent` if supported; static profiles in "
+            f"`agents/{role}.md` reflect global config rather than project `models.json`."
+        )
+    return (
+        f"Paddock project effort override for `{role}` ({source}): resolved `{eff_model}/{eff_effort}` "
+        f"differs from static agent frontmatter `{static_model}/{static_effort}`. "
+        f"Pass `model: \"{eff_model}\"` when calling `Agent` if supported; note static profiles in "
+        f"`agents/{role}.md` reflect global config (per-project `effort` overrides are not reflected in static frontmatter)."
+    )
+
+
 def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if os.environ.get("PADDOCK_SOLO") == "1":
         return {}
@@ -255,9 +534,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                     return _deny(err)
             elif plan_file is None or not plan_file.is_file():
                 return _deny("Paddock plan-gate: planner requires an approved docs/specs/<file>.md (or existing plan).")
-            return {}
-
-        if role == "builder":
+        elif role == "builder":
             plan_file = _resolve_doc_ref(cwd, prompt, "plans")
             if plan_file is None or not plan_file.is_file():
                 return _deny("Paddock plan-gate: builder requires a named existing docs/plans/<file>.md.")
@@ -267,28 +544,34 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             err = _check_approval_gate(plan_file, prompt_ts, "Approval Gate 2")
             if err:
                 return _deny(err)
-            return {}
+        else:
+            mode_match = MODE_RE.search(prompt)
+            plan_file = _resolve_doc_ref(cwd, prompt, "plans")
+            if not mode_match and plan_file is None:
+                return _deny(
+                    "Paddock plan-gate: specify 'Mode: quick|diagnose|git|lookup' "
+                    "or reference an approved docs/plans/<file>.md."
+                )
+            if plan_file is not None and not mode_match:
+                if not plan_file.is_file():
+                    return _deny(f"Paddock plan-gate: plan not found: {plan_file}")
+                text = plan_file.read_text(encoding="utf-8", errors="replace")
+                if "Agent:" not in text or "Files:" not in text:
+                    return _deny(f"Paddock plan-gate: plan '{plan_file.name}' must include 'Agent:' and 'Files:'.")
+                err = _check_approval_gate(plan_file, prompt_ts, "Approval Gate 2")
+                if err:
+                    return _deny(err)
+            if mode_match and mode_match.group(1).lower() == "git":
+                git_err = _validate_git_mode(prompt)
+                if git_err:
+                    return _deny(git_err)
 
-        mode_match = MODE_RE.search(prompt)
-        plan_file = _resolve_doc_ref(cwd, prompt, "plans")
-        if not mode_match and plan_file is None:
-            return _deny(
-                "Paddock plan-gate: specify 'Mode: quick|diagnose|git|lookup' "
-                "or reference an approved docs/plans/<file>.md."
-            )
-        if plan_file is not None and not mode_match:
-            if not plan_file.is_file():
-                return _deny(f"Paddock plan-gate: plan not found: {plan_file}")
-            text = plan_file.read_text(encoding="utf-8", errors="replace")
-            if "Agent:" not in text or "Files:" not in text:
-                return _deny(f"Paddock plan-gate: plan '{plan_file.name}' must include 'Agent:' and 'Files:'.")
-            err = _check_approval_gate(plan_file, prompt_ts, "Approval Gate 2")
-            if err:
-                return _deny(err)
-        if mode_match and mode_match.group(1).lower() == "git":
-            git_err = _validate_git_mode(prompt)
-            if git_err:
-                return _deny(git_err)
+        context_parts: list[str] = []
+        mismatch_note = _project_model_mismatch_note(cwd, role)
+        if mismatch_note:
+            context_parts.append(mismatch_note)
+        if context_parts:
+            return _allow_with_context("\n\n".join(context_parts))
         return {}
 
     return {}
@@ -349,6 +632,8 @@ def handle_session_start(payload: dict[str, Any]) -> dict[str, Any]:
         capped = memory.format_problems_capped(idx["problems"], limit=3000)
         if capped:
             sections.append(f"### Memory Validation Problems\n{capped}")
+
+    sections.append(_format_session_models_section(cwd))
 
     return {
         "hookSpecificOutput": {
