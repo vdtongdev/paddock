@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -216,6 +219,85 @@ def test_install_antigravity_dry_run_and_install_preserves_config_json(
 
     install.install_antigravity(repo, fake_home, uninstall=True)
     assert not installed_plugin.exists()
+
+
+def test_install_antigravity_reinstall_preserves_locked_root_and_prunes_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("PADDOCK_HOME", raising=False)
+    repo = tmp_path / "repo"
+    _copy_tree(REPO_ROOT / "core", repo / "core")
+    (repo / "platforms" / "antigravity").mkdir(parents=True)
+    (repo / "platforms" / "antigravity" / "plugin.json").write_text(
+        '{"name":"paddock","version":"1.0.0"}\n', encoding="utf-8"
+    )
+    sync.sync_all(repo, check=False)
+
+    fake_home = tmp_path / "home"
+    cfg = fake_home / ".gemini" / "config" / "config.json"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('{"sentinel": true}\n', encoding="utf-8")
+
+    install.install_antigravity(repo, fake_home, dry_run=False)
+    installed_plugin = fake_home / ".gemini" / "config" / "plugins" / "paddock"
+    assert (installed_plugin / "plugin.json").is_file()
+
+    stale_file = installed_plugin / "stale.txt"
+    stale_file.write_text("stale\n", encoding="utf-8")
+    stale_dir = installed_plugin / "stale_dir"
+    stale_dir.mkdir()
+    (stale_dir / "old.txt").write_text("old\n", encoding="utf-8")
+
+    (repo / "platforms" / "antigravity" / "plugin.json").write_text(
+        '{"name":"paddock","version":"2.0.0"}\n', encoding="utf-8"
+    )
+    orch_skill = repo / "platforms" / "antigravity" / "skills" / "orchestrating" / "SKILL.md"
+    orch_skill.parent.mkdir(parents=True, exist_ok=True)
+    orch_skill.write_text(
+        "---\nname: orchestrating\ndescription: updated\n---\nUpdated.\n", encoding="utf-8"
+    )
+
+    rmtree_calls: list[Path] = []
+    real_rmtree = shutil.rmtree
+
+    def _spy_rmtree(path: str | os.PathLike[str], *args, **kwargs) -> None:
+        rmtree_calls.append(Path(path))
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(install.shutil, "rmtree", _spy_rmtree)
+
+    proc: subprocess.Popen[bytes] | None = None
+    if os.name == "nt":
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            cwd=str(installed_plugin),
+            stdin=subprocess.PIPE,
+        )
+    try:
+        msgs = install.install_antigravity(repo, fake_home, dry_run=False)
+    finally:
+        if proc is not None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    assert any("customization://paddock" in m for m in msgs)
+    assert installed_plugin.resolve() not in {p.resolve() for p in rmtree_calls}
+    assert installed_plugin.is_dir()
+    assert (installed_plugin / "plugin.json").read_text(encoding="utf-8") == (
+        '{"name":"paddock","version":"2.0.0"}\n'
+    )
+    assert "Updated." in (
+        installed_plugin / "skills" / "orchestrating" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert (installed_plugin / "agents" / "paddock-implementer.md").is_file()
+    assert not stale_file.exists()
+    assert not stale_dir.exists()
+    assert cfg.read_text(encoding="utf-8") == '{"sentinel": true}\n'
 
 
 def test_install_claude_discovery_and_explicit_target_apply(

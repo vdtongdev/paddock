@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -20,15 +22,119 @@ for _path in (str(SCRIPT_DIR), str(REPO_ROOT)):
 from core.config import agents  # noqa: E402
 import sync  # noqa: E402
 
+_IGNORED_PLUGIN_PATTERNS: tuple[str, ...] = (
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    ".pytest_cache",
+)
+
+
+def _is_ignored_plugin_entry(name: str) -> bool:
+    return any(fnmatch.fnmatch(name, pattern) for pattern in _IGNORED_PLUGIN_PATTERNS)
+
+
+def _has_ignored_plugin_part(rel: Path) -> bool:
+    return any(_is_ignored_plugin_entry(part) for part in rel.parts)
+
+
+def _validate_plugin_dir(path: Path, *, label: str) -> None:
+    if agents._is_symlink_or_junction(path):
+        raise ValueError(f"Refusing symlinked {label} directory: {path}")
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"Expected {label} directory, found non-directory: {path}")
+
+
+def _collect_plugin_tree(src: Path) -> tuple[set[Path], dict[Path, Path]]:
+    """Collect expected relative dirs and files from `src`, skipping ignored caches."""
+    _validate_plugin_dir(src, label="plugin source")
+    if not src.exists():
+        raise FileNotFoundError(f"Missing plugin source directory: {src}")
+
+    expected_dirs: set[Path] = set()
+    expected_files: dict[Path, Path] = {}
+    for dirpath_str, dirnames, filenames in os.walk(src, topdown=True, followlinks=False):
+        cur_dir = Path(dirpath_str)
+        kept_dirs: list[str] = []
+        for dname in sorted(dirnames):
+            if _is_ignored_plugin_entry(dname):
+                continue
+            src_subdir = cur_dir / dname
+            if agents._is_symlink_or_junction(src_subdir):
+                raise ValueError(f"Refusing symlinked plugin source directory: {src_subdir}")
+            expected_dirs.add(src_subdir.relative_to(src))
+            kept_dirs.append(dname)
+        dirnames[:] = kept_dirs
+
+        for fname in sorted(filenames):
+            if _is_ignored_plugin_entry(fname):
+                continue
+            src_file = cur_dir / fname
+            if agents._is_symlink_or_junction(src_file):
+                raise ValueError(f"Refusing symlinked plugin source file: {src_file}")
+            if not src_file.is_file():
+                raise ValueError(f"Expected regular file in plugin source: {src_file}")
+            expected_files[src_file.relative_to(src)] = src_file
+    return expected_dirs, expected_files
+
+
+def _prune_stale_plugin_entries(
+    dst: Path,
+    expected_dirs: set[Path],
+    expected_files: dict[Path, Path],
+) -> None:
+    """Remove stale files and empty stale subdirectories under `dst` without removing `dst`."""
+    for dirpath_str, dirnames, filenames in os.walk(dst, topdown=False, followlinks=False):
+        cur_dir = Path(dirpath_str)
+        if cur_dir != dst and agents._is_symlink_or_junction(cur_dir):
+            raise ValueError(f"Refusing symlinked plugin destination directory: {cur_dir}")
+        rel_dir = Path(".") if cur_dir == dst else cur_dir.relative_to(dst)
+        if rel_dir != Path(".") and _has_ignored_plugin_part(rel_dir):
+            continue
+
+        for dname in dirnames:
+            if _is_ignored_plugin_entry(dname):
+                continue
+            dpath = cur_dir / dname
+            if agents._is_symlink_or_junction(dpath):
+                raise ValueError(f"Refusing symlinked plugin destination directory: {dpath}")
+
+        for fname in filenames:
+            if _is_ignored_plugin_entry(fname):
+                continue
+            fpath = cur_dir / fname
+            if agents._is_symlink_or_junction(fpath):
+                raise ValueError(f"Refusing symlinked plugin destination file: {fpath}")
+            if fpath.relative_to(dst) not in expected_files:
+                fpath.unlink()
+
+        if cur_dir != dst and rel_dir not in expected_dirs and not any(cur_dir.iterdir()):
+            cur_dir.rmdir()
+
 
 def _copy_plugin_tree(src: Path, dst: Path) -> None:
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(
-        src,
-        dst,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo", ".pytest_cache"),
-    )
+    """Sync `src` into `dst` in place so locked `dst` root handles survive reinstall."""
+    expected_dirs, expected_files = _collect_plugin_tree(src)
+    _validate_plugin_dir(dst, label="plugin destination")
+    dst.mkdir(parents=True, exist_ok=True)
+
+    for rel_dir in sorted(expected_dirs, key=lambda p: (len(p.parts), p.as_posix())):
+        dst_dir = dst / rel_dir
+        _validate_plugin_dir(dst_dir, label="plugin destination")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+
+    for rel_file in sorted(expected_files, key=lambda p: p.as_posix()):
+        dst_file = dst / rel_file
+        if agents._is_symlink_or_junction(dst_file):
+            raise ValueError(f"Refusing symlinked plugin destination file: {dst_file}")
+        if dst_file.exists() and dst_file.is_dir():
+            raise ValueError(f"Expected plugin destination file, found directory: {dst_file}")
+        src_bytes = expected_files[rel_file].read_bytes()
+        if dst_file.is_file() and dst_file.read_bytes() == src_bytes:
+            continue
+        sync._atomic_write_bytes(dst_file, src_bytes)
+
+    _prune_stale_plugin_entries(dst, expected_dirs, expected_files)
 
 
 def _format_apply_messages(label: str, report: dict[str, Any], *, dry_run: bool) -> list[str]:
