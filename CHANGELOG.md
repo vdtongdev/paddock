@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Zero-dependency Python `3.12+` package configuration (`pyproject.toml`, `core/__init__.py`, `core/memory/__init__.py`) using `hatchling` to bundle `core/`, `platforms/antigravity/`, `platforms/claude/`, and `.claude-plugin/marketplace.json` under `paddock/_bundle/` for clone-free `uv tool install` and `uvx` distribution.
+- Unified `paddock` CLI package (`paddock/__init__.py`, `paddock/version.py`, `paddock/installer.py`, `paddock/updater.py`, `paddock/cli.py`) providing `paddock install`, `paddock uninstall`, `paddock update`, `paddock status`, `paddock models ...`, and `paddock --version`.
+- Source-root resolution (`resolve_source_root`, `source_mode`, `verify_bundle_integrity`), auto-detection for Antigravity (`~/.gemini`) and Claude Code (`claude` / `~/.claude`), automated `claude plugin marketplace` and `claude plugin install` execution with dry-run/missing-CLI fallback, and `collect_status()` inspection.
+- GitHub Release updater (`paddock/updater.py`) syncing the `paddock` tool via `uv tool install --force` and updating installed platform plugins against the latest release tag (with `gh api` fallback, `--check`, `--version`, `--main`, `--platform`, `--plugins-only`, `--dry-run`, and Windows file-in-use recovery commands).
+- Single-source SemVer validation (`check_version_parity`) in `scripts/sync.py` checking identical versions across `pyproject.toml`, `paddock/__init__.py`, `platforms/antigravity/plugin.json`, `platforms/claude/.claude-plugin/plugin.json`, and `mcp_server.py` (canonical and synced copies).
+- GitHub Actions CI (`.github/workflows/ci.yml`) on `ubuntu-latest` and `windows-latest` running sync checks, `pytest`, wheel cleanliness checks, and out-of-repo isolated venv smoke tests, plus release automation (`.github/workflows/release.yml`) on `v*` tags producing deterministic plugin archives, wheels, `SHA256SUMS.txt`, and GitHub Releases.
+- CLI, bundle fallback, updater, version parity, and workflow structural tests (`tests/test_paddock_cli.py`, `tests/test_sync_drift.py`).
+
+### Changed
+- Converted `scripts/install.py` and `scripts/models.py` into thin backward-compatible wrappers delegating to `paddock.installer` and `core.config.models.main`, and integrated `check_version_parity` into `scripts/sync.py`.
+- Rewrote `README.md` with a user-first `Install` / `Update` / `Uninstall` / `paddock status` onboarding flow, `paddock models` CLI documentation, and contributor-only `Development` section.
+
+### Security
+- Hardcoded HTTPS GitHub repository/API URLs (`https://github.com/vdtongdev/paddock`) in `paddock/updater.py` with strict `^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$` tag validation, `shell=False` subprocess execution, and `GITHUB_TOKEN`/`GH_TOKEN` secret redaction.
+- Enforced path-traversal and symlink/junction validation across source-root resolution and in-place plugin synchronization while guaranteeing `paddock uninstall` never deletes `~/.paddock/`.
+- Scoped GitHub Actions workflow permissions to least privilege (`contents: read` in `ci.yml`; `contents: write` restricted to `v*` tag builds in `release.yml`).
+
 ## [0.2.0] - 2026-11-25
 
 ### Added
