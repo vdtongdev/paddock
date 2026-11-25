@@ -1,5 +1,5 @@
 {
   "name": "paddock",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Paddock orchestration loop and unified ~/.paddock/ typed memory suite for Claude Code."
 }

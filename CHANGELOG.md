@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-25
+
 ### Added
 - Zero-dependency Python `3.12+` package configuration (`pyproject.toml`, `core/__init__.py`, `core/memory/__init__.py`) using `hatchling` to bundle `core/`, `platforms/antigravity/`, `platforms/claude/`, and `.claude-plugin/marketplace.json` under `paddock/_bundle/` for clone-free `uv tool install` and `uvx` distribution.
 - Unified `paddock` CLI package (`paddock/__init__.py`, `paddock/version.py`, `paddock/installer.py`, `paddock/updater.py`, `paddock/cli.py`) providing `paddock install`, `paddock uninstall`, `paddock update`, `paddock status`, `paddock models ...`, and `paddock --version`.
@@ -52,5 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clean 3,000-character problem truncation in `format_problems_capped()` without emitting a leading `; ...` prefix.
 - In-place atomic Antigravity plugin reinstall in `scripts/install.py` with stale-entry pruning to prevent Windows `[WinError 32]` directory handle locks.
 
-[Unreleased]: https://github.com/vdtongdev/paddock/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/vdtongdev/paddock/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/vdtongdev/paddock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vdtongdev/paddock/releases/tag/v0.2.0
