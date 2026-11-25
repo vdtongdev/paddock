@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 import paddock
-from paddock import cli, installer, updater
+from paddock import cli, installer, updater, version
 from scripts import install as install_script
 from scripts import models as models_script
 
@@ -526,10 +526,13 @@ def test_update_check_upgrade_and_gh_fallback(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     captured_requests: list[Any] = []
+    (major, minor, _patch), _ = version.parse_semver(paddock.__version__)
+    newer_tag = f"v{major}.{minor + 1}.0"
+    fallback_tag = f"v{major}.{minor + 2}.0"
 
     def _fake_urlopen(req: Any, timeout: float = 15.0) -> _FakeHTTPResponse:
         captured_requests.append(req)
-        return _FakeHTTPResponse({"tag_name": "v0.3.0"})
+        return _FakeHTTPResponse({"tag_name": newer_tag})
 
     monkeypatch.setattr(updater.urllib.request, "urlopen", _fake_urlopen)
 
@@ -537,7 +540,7 @@ def test_update_check_upgrade_and_gh_fallback(
     assert cli.main(["update", "--check", "--json"]) == 0
     check_data = json.loads(capsys.readouterr().out)
     assert check_data["status"] == "update-available"
-    assert check_data["target_tag"] == "v0.3.0"
+    assert check_data["target_tag"] == newer_tag
     assert check_data["ref_source"] == "github-api"
     assert check_data["update_available"] is True
     assert captured_requests[0].full_url == updater.GITHUB_LATEST_RELEASE_API
@@ -581,7 +584,7 @@ def test_update_check_upgrade_and_gh_fallback(
     assert cli.main(["update", "--home", str(fake_home), "--json"]) == 0
     upgrade_data = json.loads(capsys.readouterr().out)
     assert upgrade_data["status"] == "updated"
-    assert upgrade_data["target_ref"] == "v0.3.0"
+    assert upgrade_data["target_ref"] == newer_tag
     assert upgrade_data["plugin_install"] == {"action": "install", "platforms": ["antigravity"]}
     assert [cmd for cmd, _ in upgrade_calls] == [
         [
@@ -589,7 +592,7 @@ def test_update_check_upgrade_and_gh_fallback(
             "tool",
             "install",
             "--force",
-            "git+https://github.com/vdtongdev/paddock.git@v0.3.0",
+            f"git+https://github.com/vdtongdev/paddock.git@{newer_tag}",
         ],
         [
             "/mock/bin/paddock",
@@ -610,7 +613,7 @@ def test_update_check_upgrade_and_gh_fallback(
 
     def _run_gh(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         gh_calls.append((list(args), dict(kwargs)))
-        return _completed(args, returncode=0, stdout='{"tag_name": "v0.4.0"}')
+        return _completed(args, returncode=0, stdout=json.dumps({"tag_name": fallback_tag}))
 
     monkeypatch.setattr(updater.urllib.request, "urlopen", _fail_urlopen)
     monkeypatch.setattr(
@@ -621,7 +624,7 @@ def test_update_check_upgrade_and_gh_fallback(
     monkeypatch.setattr(updater.subprocess, "run", _run_gh)
     assert cli.main(["update", "--check", "--json"]) == 0
     gh_data = json.loads(capsys.readouterr().out)
-    assert gh_data["target_tag"] == "v0.4.0"
+    assert gh_data["target_tag"] == fallback_tag
     assert gh_data["ref_source"] == "gh-cli"
     assert gh_calls[0][0] == ["/mock/bin/gh", "api", "repos/vdtongdev/paddock/releases/latest"]
     assert gh_calls[0][1]["shell"] is False
