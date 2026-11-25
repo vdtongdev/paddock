@@ -25,6 +25,7 @@ from core.config import agents, models  # noqa: E402
 
 CORE_MEMORY_FILES = ("memory.py", "mcp_server.py")
 CORE_CONFIG_FILES = ("models.py", "agents.py")
+CORE_GIT_FILES = ("worktree.py", "worktree_mcp_server.py")
 
 
 def _normalize_lf(data: bytes) -> bytes:
@@ -102,7 +103,7 @@ def discover_platforms(repo_root: Path) -> list[Path]:
 
 
 def sync_all(repo_root: Path, check: bool = False) -> list[str]:
-    """Sync `core/skills/*`, `core/memory/*`, `core/config/*`, and `core/agents/*` into platform adapters.
+    """Sync `core/skills/*`, `core/memory/*`, `core/config/*`, `core/git/*`, and `core/agents/*` into platform adapters.
 
     Compiles `core/agents/*.md` using built-in `balanced` defaults (never personal
     `~/.paddock/models.json`) into `platforms/<plat>/agents/`.
@@ -113,6 +114,7 @@ def sync_all(repo_root: Path, check: bool = False) -> list[str]:
     core_skills_dir = repo_root / "core" / "skills"
     core_mem_dir = repo_root / "core" / "memory"
     core_cfg_dir = repo_root / "core" / "config"
+    core_git_dir = repo_root / "core" / "git"
     core_agents_dir = repo_root / "core" / "agents"
     if not core_skills_dir.is_dir():
         raise FileNotFoundError(f"Missing core/skills directory: {core_skills_dir}")
@@ -153,6 +155,7 @@ def sync_all(repo_root: Path, check: bool = False) -> list[str]:
         for src_dir, filenames in (
             (core_mem_dir, CORE_MEMORY_FILES),
             (core_cfg_dir, CORE_CONFIG_FILES),
+            (core_git_dir, CORE_GIT_FILES),
         ):
             for fname in filenames:
                 src_file = src_dir / fname
@@ -272,6 +275,9 @@ _VERSION_PARITY_SOURCES: tuple[tuple[str, Callable[[Path], str]], ...] = (
     ("core/memory/mcp_server.py", _read_mcp_server_version),
     ("platforms/antigravity/scripts/paddock_core/mcp_server.py", _read_mcp_server_version),
     ("platforms/claude/scripts/paddock_core/mcp_server.py", _read_mcp_server_version),
+    ("core/git/worktree_mcp_server.py", _read_mcp_server_version),
+    ("platforms/antigravity/scripts/paddock_core/worktree_mcp_server.py", _read_mcp_server_version),
+    ("platforms/claude/scripts/paddock_core/worktree_mcp_server.py", _read_mcp_server_version),
 )
 
 

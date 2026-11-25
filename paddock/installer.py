@@ -33,6 +33,8 @@ _REQUIRED_ANTIGRAVITY_ASSETS: tuple[str, ...] = (
     "platforms/antigravity/scripts/paddock_core/mcp_server.py",
     "platforms/antigravity/scripts/paddock_core/models.py",
     "platforms/antigravity/scripts/paddock_core/agents.py",
+    "platforms/antigravity/scripts/paddock_core/worktree.py",
+    "platforms/antigravity/scripts/paddock_core/worktree_mcp_server.py",
     "core/skills/paddock-models/SKILL.md",
 )
 
@@ -44,6 +46,8 @@ _REQUIRED_BUNDLE_ASSETS: tuple[str, ...] = (
     "platforms/claude/scripts/paddock_core/mcp_server.py",
     "platforms/claude/scripts/paddock_core/models.py",
     "platforms/claude/scripts/paddock_core/agents.py",
+    "platforms/claude/scripts/paddock_core/worktree.py",
+    "platforms/claude/scripts/paddock_core/worktree_mcp_server.py",
 )
 
 

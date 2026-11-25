@@ -33,6 +33,17 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "matcher": "mcp__.*paddock-worktree__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script \"${CLAUDE_PLUGIN_ROOT}/scripts/claude_hooks.py\" pre-tool-use",
+            "commandWindows": "uv run --no-project --script \"%CLAUDE_PLUGIN_ROOT%\\scripts\\claude_hooks.py\" pre-tool-use",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUse": [

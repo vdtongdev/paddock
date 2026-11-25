@@ -80,7 +80,7 @@ def test_parse_all_six_canonical_agents_and_reject_invalid_definitions() -> None
 
     assert loaded["generalist"].default_tier == "fast"
     assert loaded["generalist"].platforms == ("antigravity", "claude", "codex", "copilot", "pi")
-    assert loaded["generalist"].capabilities == ("read", "edit", "write", "search", "web")
+    assert loaded["generalist"].capabilities == ("read", "edit", "write", "search", "web", "mcp")
     assert loaded["generalist"].disallowed == ("shell", "delegate")
 
     assert loaded["implementer"].default_tier == "workhorse"
@@ -137,7 +137,7 @@ def test_parse_all_six_canonical_agents_and_reject_invalid_definitions() -> None
 
 
 def test_capability_mapping_and_platform_compilation_and_footers() -> None:
-    all_caps = ("read", "edit", "write", "shell", "tasks", "search", "web", "delegate")
+    all_caps = ("read", "edit", "write", "shell", "tasks", "search", "web", "delegate", "mcp")
     assert agents.map_capabilities(all_caps, "antigravity") == [
         "read_file",
         "edit_file",
@@ -145,6 +145,7 @@ def test_capability_mapping_and_platform_compilation_and_footers() -> None:
         "run_command",
         "manage_task",
         "search_web",
+        "call_mcp_tool",
     ]
     assert agents.map_capabilities(all_caps, "claude") == [
         "Read",
@@ -156,6 +157,9 @@ def test_capability_mapping_and_platform_compilation_and_footers() -> None:
         "WebFetch",
         "WebSearch",
         "Agent",
+        "mcp__plugin_paddock_paddock-worktree__worktree_create",
+        "mcp__plugin_paddock_paddock-worktree__worktree_list",
+        "mcp__plugin_paddock_paddock-worktree__worktree_remove",
     ]
 
     with pytest.raises(ValueError):
@@ -174,7 +178,7 @@ def test_capability_mapping_and_platform_compilation_and_footers() -> None:
     assert "subagent: true" in agy_gen_fm
     assert "mainAgent: false" in agy_gen_fm
     assert "model:" not in agy_gen_fm
-    assert "  - read_file\n  - edit_file\n  - write_file\n  - search_web" in agy_gen_fm
+    assert "  - read_file\n  - edit_file\n  - write_file\n  - search_web\n  - call_mcp_tool" in agy_gen_fm
     assert "run_command" not in agy_gen_fm
     assert "Inside `run_workflow`, submit structured JSON via `finish`" in agy_gen_body
     assert "Standalone via `invoke_subagent`, end your reply with `## Evidence` and `## Unverified`." in agy_gen_body
@@ -191,11 +195,17 @@ def test_capability_mapping_and_platform_compilation_and_footers() -> None:
 
     # Claude Code compilation checks
     cl_gen_fm, cl_gen_body = _split_frontmatter(rendered["claude"]["generalist.md"])
-    assert "name: generalist" in cl_gen_fm
-    assert "model: haiku" in cl_gen_fm
-    assert "effort: medium" in cl_gen_fm
-    assert "tools: Read, Edit, Write, Grep, Glob, WebFetch, WebSearch" in cl_gen_fm
-    assert "disallowedTools: Bash, Agent" in cl_gen_fm
+    cl_gen_lines = cl_gen_fm.splitlines()
+    assert "name: generalist" in cl_gen_lines
+    assert "model: haiku" in cl_gen_lines
+    assert "effort: medium" in cl_gen_lines
+    assert (
+        "tools: Read, Edit, Write, Grep, Glob, WebFetch, WebSearch, "
+        "mcp__plugin_paddock_paddock-worktree__worktree_create, "
+        "mcp__plugin_paddock_paddock-worktree__worktree_list, "
+        "mcp__plugin_paddock_paddock-worktree__worktree_remove"
+    ) in cl_gen_lines
+    assert "disallowedTools: Bash, Agent" in cl_gen_lines
     assert "End every reply with `## Evidence` and `## Unverified`." in cl_gen_body
 
     cl_bld_fm, _ = _split_frontmatter(rendered["claude"]["builder.md"])

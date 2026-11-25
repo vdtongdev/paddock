@@ -849,3 +849,419 @@ def test_corrupt_models_json_fails_open_to_balanced(tmp_path: Path) -> None:
         paddock_home,
     )
     assert swarm_impl["overwrite"]["model"] == "gemini-4-neon-medium"
+
+
+def test_agy_hooks_json_includes_call_mcp_tool_matcher() -> None:
+    hooks_cfg = json.loads(
+        (REPO_ROOT / "platforms" / "antigravity" / "hooks.json").read_text(encoding="utf-8")
+    )
+    pre_entries = hooks_cfg["paddock"]["PreToolUse"]
+    matched = [entry for entry in pre_entries if entry.get("matcher") == "call_mcp_tool"]
+    assert len(matched) == 1
+    hook = matched[0]["hooks"][0]
+    assert "agy_hooks.py PreToolUse" in hook["command"]
+    assert hook["timeout"] == 15
+
+
+def test_call_mcp_tool_worktree_routing_gates_and_ask(tmp_path: Path) -> None:
+    paddock_home = tmp_path / "paddock"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt = repo / ".worktrees" / "wt-a"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "feat/wt-a", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+
+    plans_dir = repo / "docs" / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+
+    t_user = datetime.datetime(2026, 11, 25, 10, 0, 0, tzinfo=datetime.timezone.utc)
+    t_past = t_user.timestamp() - 60.0
+    t_future = t_user.timestamp() + 60.0
+
+    approved_plan = plans_dir / "approved.md"
+    approved_plan.write_text("### Task 1\n- Agent: implementer\n- Files: a.py\n", encoding="utf-8")
+    os.utime(approved_plan, (t_past, t_past))
+
+    unapproved_plan = plans_dir / "unapproved.md"
+    unapproved_plan.write_text("### Task 1\n- Agent: implementer\n- Files: a.py\n", encoding="utf-8")
+    os.utime(unapproved_plan, (t_future, t_future))
+
+    malformed_plan = plans_dir / "malformed.md"
+    malformed_plan.write_text("### Task 1\nMissing required fields.\n", encoding="utf-8")
+    os.utime(malformed_plan, (t_past, t_past))
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": t_user.isoformat().replace("+00:00", "Z"),
+                "content": "approved",
+            }
+        ],
+    )
+
+    for server_name in ("paddock_paddock-worktree", "paddock-worktree"):
+        # worktree_list -> allow
+        assert (
+            _run_hook(
+                "PreToolUse",
+                {
+                    "hookEventName": "PreToolUse",
+                    "cwd": str(repo),
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "call_mcp_tool",
+                        "args": {"ServerName": server_name, "ToolName": "worktree_list", "Arguments": {"cwd": str(repo)}},
+                    },
+                },
+                paddock_home,
+            )
+            == {"decision": "allow"}
+        )
+
+        # worktree_create without plan_path -> allow
+        for extra_args in ({}, {"plan_path": ""}):
+            assert (
+                _run_hook(
+                    "PreToolUse",
+                    {
+                        "hookEventName": "PreToolUse",
+                        "cwd": str(repo),
+                        "transcriptPath": str(transcript),
+                        "toolCall": {
+                            "name": "call_mcp_tool",
+                            "args": {
+                                "ServerName": server_name,
+                                "ToolName": "worktree_create",
+                                "Arguments": {"cwd": str(repo), "slug": "feat-x", **extra_args},
+                            },
+                        },
+                    },
+                    paddock_home,
+                )
+                == {"decision": "allow"}
+            )
+
+        # worktree_create missing / malformed / unapproved plan_path -> deny
+        deny_missing = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": server_name,
+                        "ToolName": "worktree_create",
+                        "Arguments": {"cwd": str(repo), "slug": "feat-x", "plan_path": "docs/plans/missing.md"},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        assert deny_missing["decision"] == "deny" and "does not exist" in deny_missing["reason"]
+
+        deny_malformed = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": server_name,
+                        "ToolName": "worktree_create",
+                        "Arguments": {"cwd": str(repo), "slug": "feat-x", "plan_path": "docs/plans/malformed.md"},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        assert deny_malformed["decision"] == "deny" and "Agent:" in deny_malformed["reason"]
+
+        deny_unapproved = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": server_name,
+                        "ToolName": "worktree_create",
+                        "Arguments": {"cwd": str(repo), "slug": "feat-x", "plan_path": "docs/plans/unapproved.md"},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        assert deny_unapproved["decision"] == "deny" and "Approval Gate 2" in deny_unapproved["reason"]
+
+        # worktree_create with approved relative plan_path resolved via Arguments.cwd (payload.cwd differs) -> allow
+        assert (
+            _run_hook(
+                "PreToolUse",
+                {
+                    "hookEventName": "PreToolUse",
+                    "cwd": str(tmp_path),
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "call_mcp_tool",
+                        "args": {
+                            "ServerName": server_name,
+                            "ToolName": "worktree_create",
+                            "Arguments": {"cwd": str(repo), "slug": "feat-x", "plan_path": "docs/plans/approved.md"},
+                        },
+                    },
+                },
+                paddock_home,
+            )
+            == {"decision": "allow"}
+        )
+
+        # worktree_remove -> ask with exact target & delete_branch boolean
+        ask_default = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": server_name,
+                        "ToolName": "worktree_remove",
+                        "Arguments": {"cwd": str(repo), "slug": "wt-a"},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        assert ask_default == {
+            "decision": "ask",
+            "reason": "Confirm removing worktree '.worktrees/wt-a' (delete_branch=False). Non-force only.",
+        }
+
+        ask_del = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": server_name,
+                        "ToolName": "worktree_remove",
+                        "Arguments": {"cwd": str(repo), "slug": "wt-a", "delete_branch": True},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        assert ask_del == {
+            "decision": "ask",
+            "reason": "Confirm removing worktree '.worktrees/wt-a' (delete_branch=True). Non-force only.",
+        }
+
+    # server_name lowercase alias + repo_root fallback when payload.cwd is worktree and Arguments.cwd omitted
+    assert (
+        _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(wt),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "server_name": "paddock-worktree",
+                        "ToolName": "worktree_create",
+                        "Arguments": {"slug": "wt-b", "plan_path": "docs/plans/approved.md"},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        == {"decision": "allow"}
+    )
+
+    # Unrelated MCP server -> allow
+    assert (
+        _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "call_mcp_tool",
+                    "args": {
+                        "ServerName": "paddock_paddock-mem",
+                        "ToolName": "mem_write",
+                        "Arguments": {"cwd": str(repo)},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        == {"decision": "allow"}
+    )
+
+
+def test_run_workflow_worktree_plan_resolution_priority_and_fallback(tmp_path: Path) -> None:
+    paddock_home = tmp_path / "paddock"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt = repo / ".worktrees" / "wt-plan"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "feat/wt-plan", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+    wt_sub = wt / "sub"
+    wt_sub.mkdir(parents=True, exist_ok=True)
+
+    t_user = datetime.datetime(2026, 11, 25, 11, 0, 0, tzinfo=datetime.timezone.utc)
+    t_past = t_user.timestamp() - 60.0
+    t_future = t_user.timestamp() + 60.0
+
+    transcript = tmp_path / "transcript.jsonl"
+    _write_transcript(
+        transcript,
+        [
+            {
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "created_at": t_user.isoformat().replace("+00:00", "Z"),
+                "content": "go",
+            }
+        ],
+    )
+
+    # Both repo and worktree have docs/plans/feat.md; repo is approved, worktree copy is unapproved -> worktree wins
+    repo_plan = repo / "docs" / "plans" / "feat.md"
+    wt_plan = wt / "docs" / "plans" / "feat.md"
+    repo_plan.parent.mkdir(parents=True, exist_ok=True)
+    wt_plan.parent.mkdir(parents=True, exist_ok=True)
+    repo_plan.write_text("### Task 1\n- Agent: implementer\n- Files: a.py\n", encoding="utf-8")
+    wt_plan.write_text("### Task 1\n- Agent: implementer\n- Files: a.py\n", encoding="utf-8")
+    os.utime(repo_plan, (t_past, t_past))
+    os.utime(wt_plan, (t_future, t_future))
+
+    for wt_arg in (".worktrees/wt-plan", str(wt)):
+        deny_wt = _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(repo),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "run_workflow",
+                    "args": {
+                        "ScriptPath": "workflows/build_plan.py",
+                        "Args": {"worktree": wt_arg, "plan_path": "docs/plans/feat.md"},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        assert deny_wt["decision"] == "deny" and "Approval Gate 2" in deny_wt["reason"]
+
+    # Also verify _resolve_doc_ref branch checks worktree first when Args.plan_path is omitted
+    deny_ref = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(repo),
+            "transcriptPath": str(transcript),
+            "toolCall": {
+                "name": "run_workflow",
+                "args": {
+                    "ScriptPath": "workflows/build_plan.py",
+                    "Script": "Build docs/plans/feat.md",
+                    "Args": {"worktree": ".worktrees/wt-plan"},
+                },
+            },
+        },
+        paddock_home,
+    )
+    assert deny_ref["decision"] == "deny" and "Approval Gate 2" in deny_ref["reason"]
+
+    # Once active worktree copy is approved, both relative and absolute Args.worktree succeed
+    os.utime(wt_plan, (t_past, t_past))
+    for wt_arg in (".worktrees/wt-plan", str(wt)):
+        assert (
+            _run_hook(
+                "PreToolUse",
+                {
+                    "hookEventName": "PreToolUse",
+                    "cwd": str(repo),
+                    "transcriptPath": str(transcript),
+                    "toolCall": {
+                        "name": "run_workflow",
+                        "args": {
+                            "ScriptPath": "workflows/build_plan.py",
+                            "Args": {"worktree": wt_arg, "plan_path": "docs/plans/feat.md"},
+                        },
+                    },
+                },
+                paddock_home,
+            )
+            == {"decision": "allow"}
+        )
+
+    # Plan absent from worktree falls back cleanly to parent repo cwd / repo_root
+    parent_only = repo / "docs" / "plans" / "parent-only.md"
+    parent_only.write_text("### Task 1\n- Agent: implementer\n- Files: b.py\n", encoding="utf-8")
+    os.utime(parent_only, (t_future, t_future))
+
+    deny_fallback = _run_hook(
+        "PreToolUse",
+        {
+            "hookEventName": "PreToolUse",
+            "cwd": str(wt_sub),
+            "transcriptPath": str(transcript),
+            "toolCall": {
+                "name": "run_workflow",
+                "args": {
+                    "ScriptPath": "workflows/build_plan.py",
+                    "Args": {"worktree": str(wt), "plan_path": "docs/plans/parent-only.md"},
+                },
+            },
+        },
+        paddock_home,
+    )
+    assert deny_fallback["decision"] == "deny" and "Approval Gate 2" in deny_fallback["reason"]
+
+    os.utime(parent_only, (t_past, t_past))
+    assert (
+        _run_hook(
+            "PreToolUse",
+            {
+                "hookEventName": "PreToolUse",
+                "cwd": str(wt_sub),
+                "transcriptPath": str(transcript),
+                "toolCall": {
+                    "name": "run_workflow",
+                    "args": {
+                        "ScriptPath": "workflows/build_plan.py",
+                        "Args": {"worktree": str(wt), "plan_path": "docs/plans/parent-only.md"},
+                    },
+                },
+            },
+            paddock_home,
+        )
+        == {"decision": "allow"}
+    )

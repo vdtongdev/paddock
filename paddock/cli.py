@@ -1,4 +1,4 @@
-"""Unified top-level CLI entrypoint for Paddock (`install`, `uninstall`, `update`, `status`, `models`)."""
+"""Unified top-level CLI entrypoint for Paddock (`install`, `uninstall`, `update`, `status`, `models`, `worktree`)."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 from core.config import models
+from core.git import worktree
 from paddock import __version__, installer, updater
 
 _PLATFORM_CHOICES: tuple[str, ...] = ("antigravity", "claude", "all")
@@ -40,6 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  paddock status --json\n"
             "  paddock update --check\n"
             "  paddock models show --json\n"
+            "  paddock worktree list --json\n"
         ),
     )
     parser.add_argument(
@@ -153,7 +155,171 @@ def _build_parser() -> argparse.ArgumentParser:
         add_help=False,
     )
 
+    p_worktree = sub.add_parser(
+        "worktree",
+        help="Create, list, and safely remove isolated Paddock git worktrees",
+    )
+    wt_sub = p_worktree.add_subparsers(dest="worktree_command", required=True)
+
+    p_wt_create = wt_sub.add_parser(
+        "create",
+        help="Idempotently create or reuse .worktrees/<slug> on <prefix>/<slug>",
+    )
+    p_wt_create.add_argument("slug", help="Worktree slug under .worktrees/")
+    p_wt_create.add_argument(
+        "--prefix",
+        default="feat",
+        help=f"Branch prefix (<prefix>/<slug>; one of {', '.join(worktree.VALID_PREFIXES)}; default: feat)",
+    )
+    p_wt_create.add_argument(
+        "--base",
+        default=None,
+        metavar="REF",
+        help="Base git ref (defaults to main, master, or HEAD)",
+    )
+    p_wt_create.add_argument(
+        "--plan-path",
+        default=None,
+        metavar="PATH",
+        help="Plan file path inside repository to copy if untracked or missing",
+    )
+    p_wt_create.add_argument(
+        "--copy",
+        dest="copy_paths",
+        action="extend",
+        nargs="+",
+        default=None,
+        metavar="PATH",
+        help="Additional repo-relative file path(s) to copy if untracked or missing",
+    )
+    p_wt_create.add_argument(
+        "--no-codegraph",
+        dest="init_codegraph",
+        action="store_false",
+        default=True,
+        help="Skip running `codegraph init -y` in the created worktree",
+    )
+    p_wt_create.add_argument("--cwd", default=".", metavar="DIR", help="Repository path (default: .)")
+    p_wt_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    p_wt_list = wt_sub.add_parser(
+        "list",
+        help="List registered git worktrees for the repository",
+    )
+    p_wt_list.add_argument("--cwd", default=".", metavar="DIR", help="Repository path (default: .)")
+    p_wt_list.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    p_wt_remove = wt_sub.add_parser(
+        "remove",
+        help="Non-force remove registered .worktrees/<slug> checkout",
+    )
+    p_wt_remove.add_argument("slug", help="Paddock-managed worktree slug under .worktrees/")
+    p_wt_remove.add_argument(
+        "--delete-branch",
+        action="store_true",
+        help="Also delete the worktree branch via non-force `git branch -d`",
+    )
+    p_wt_remove.add_argument("--cwd", default=".", metavar="DIR", help="Repository path (default: .)")
+    p_wt_remove.add_argument("--json", action="store_true", help="Emit JSON output")
+
     return parser
+
+
+def _format_worktree_create_text(res: dict[str, Any]) -> str:
+    """Format `worktree.create_worktree()` result as concise terminal summary lines."""
+    if res.get("reused"):
+        headline = f"Reused worktree: {res['worktree_path']} (branch: {res['branch']})"
+    elif res.get("reused_branch"):
+        headline = f"Created worktree: {res['worktree_path']} (branch: {res['branch']}, attached existing)"
+    else:
+        headline = f"Created worktree: {res['worktree_path']} (branch: {res['branch']}, base: {res['base']})"
+    lines = [headline]
+    if res.get("exclude_updated"):
+        lines.append("Updated .git/info/exclude with .worktrees/")
+    copied = res.get("copied_files") or []
+    if copied:
+        lines.append(f"Copied files: {', '.join(copied)}")
+    lines.append(f"CodeGraph: {res.get('codegraph_status', 'unknown')}")
+    return "\n".join(lines)
+
+
+def _format_worktree_list_text(res: dict[str, Any]) -> str:
+    """Format `worktree.list_worktrees()` result as concise terminal summary lines."""
+    lines = [f"Repository: {res['repo_root']}"]
+    entries = res.get("worktrees") or []
+    if not entries:
+        lines.append("No worktrees found.")
+        return "\n".join(lines)
+    for entry in entries:
+        tags: list[str] = []
+        if entry.get("is_main"):
+            tags.append("main")
+        elif entry.get("is_paddock_managed"):
+            tags.append(f"paddock:{entry.get('slug')}")
+        if entry.get("detached"):
+            tags.append("detached")
+        if entry.get("locked"):
+            tags.append("locked")
+        if entry.get("prunable"):
+            tags.append("prunable")
+        if entry.get("bare"):
+            tags.append("bare")
+        branch = entry.get("branch") or "(detached)"
+        tag_str = f" [{', '.join(tags)}]" if tags else ""
+        lines.append(f"  {branch:<28} {entry['path']}{tag_str}")
+    return "\n".join(lines)
+
+
+def _format_worktree_remove_text(res: dict[str, Any]) -> str:
+    """Format `worktree.remove_worktree()` result (including branch warnings) as terminal lines."""
+    branch = res.get("branch")
+    branch_desc = f"branch: {branch}" if branch else "detached HEAD"
+    lines = [f"Removed worktree: {res['worktree_path']} (slug: {res['slug']}, {branch_desc})"]
+    if res.get("branch_deleted") and branch:
+        lines.append(f"Deleted branch: {branch}")
+    warning = res.get("branch_delete_warning")
+    if warning:
+        lines.append(f"Warning: {warning}")
+    return "\n".join(lines)
+
+
+def _run_worktree_command(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    use_json: bool,
+) -> int:
+    """Dispatch `paddock worktree <create|list|remove>` and print JSON or text summary."""
+    if args.worktree_command == "create":
+        res = worktree.create_worktree(
+            args.cwd,
+            args.slug,
+            prefix=args.prefix,
+            base=args.base,
+            plan_path=args.plan_path,
+            copy_paths=args.copy_paths,
+            init_codegraph=args.init_codegraph,
+        )
+        formatter = _format_worktree_create_text
+    elif args.worktree_command == "list":
+        res = worktree.list_worktrees(args.cwd)
+        formatter = _format_worktree_list_text
+    elif args.worktree_command == "remove":
+        res = worktree.remove_worktree(
+            args.cwd,
+            args.slug,
+            delete_branch=args.delete_branch,
+        )
+        formatter = _format_worktree_remove_text
+    else:
+        parser.error(f"Unknown worktree command: {args.worktree_command}")
+        return 2
+
+    if use_json:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print(formatter(res))
+    return 0
 
 
 def _print_result(res: dict[str, Any], *, use_json: bool) -> None:
@@ -241,6 +407,9 @@ def main(argv: list[str] | None = None) -> int:
                 home_dir=args.home,
                 json_output=use_json,
             )
+
+        if args.command == "worktree":
+            return _run_worktree_command(args, parser, use_json=use_json)
 
         parser.error(f"Unknown command: {args.command}")
         return 2

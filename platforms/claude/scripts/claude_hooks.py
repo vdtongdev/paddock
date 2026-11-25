@@ -55,6 +55,7 @@ SPEC_REF_RE = re.compile(r"docs[/\\]specs[/\\]([A-Za-z0-9._-]+\.md)")
 PLAN_REF_RE = re.compile(r"docs[/\\]plans[/\\]([A-Za-z0-9._-]+\.md)")
 MODE_RE = re.compile(r"\bMode:\s*(quick|diagnose|git|lookup)\b", re.IGNORECASE)
 VERDICT_LINE_RE = re.compile(r"(?m)^\s*(PASS|FAIL:\s*(?:impl|plan|spec|env))\s*$")
+WORKTREE_MCP_TOOL_RE = re.compile(r"\Amcp__.*paddock-worktree__(worktree_create|worktree_list|worktree_remove)\Z")
 
 ORCHESTRATOR_RULES = (
     "PADDOCK ORCHESTRATOR RULES:\n"
@@ -99,6 +100,16 @@ def _deny(reason: str) -> dict[str, Any]:
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _ask(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "ask",
             "permissionDecisionReason": reason,
         }
     }
@@ -152,18 +163,47 @@ def _git_branch(path_hint: Path, cwd: Path) -> str | None:
     return None
 
 
+def _resolve_relative_candidate(
+    rel: Path,
+    cwd: Path,
+    *priority_bases: Path | None,
+) -> Path:
+    """Resolve relative `rel` across priority bases, `cwd`, and git `repo_root`."""
+    bases: list[Path] = []
+    for base in (*priority_bases, cwd):
+        if base is not None:
+            resolved = base.resolve()
+            if resolved not in bases:
+                bases.append(resolved)
+    for base in list(bases):
+        root = memory.resolve_repo_root(base)
+        if root not in bases:
+            bases.append(root)
+    for base in bases:
+        cand = (base / rel).resolve()
+        if cand.exists():
+            return cand
+    fallback = bases[0] if bases else cwd.resolve()
+    return (fallback / rel).resolve()
+
+
+def _resolve_dir_arg(raw_dir: Any, cwd: Path) -> Path | None:
+    """Resolve an optional directory argument against `cwd` and git `repo_root`."""
+    if not isinstance(raw_dir, str) or not raw_dir.strip():
+        return None
+    p = Path(raw_dir.strip()).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return _resolve_relative_candidate(p, cwd)
+
+
 def _resolve_doc_ref(cwd: Path, text: str, kind: str) -> Path | None:
     pat = SPEC_REF_RE if kind == "specs" else PLAN_REF_RE
     m = pat.search(text)
     if not m:
         return None
     rel = Path("docs") / kind / m.group(1)
-    repo_root = memory.resolve_repo_root(cwd)
-    for base in (cwd, repo_root):
-        cand = (base / rel).resolve()
-        if cand.exists():
-            return cand
-    return (cwd / rel).resolve()
+    return _resolve_relative_candidate(rel, cwd)
 
 
 def _last_prompt_ts(session_id: str | None) -> float | None:
@@ -187,6 +227,16 @@ def _check_approval_gate(file_path: Path, prompt_ts: float | None, gate_label: s
             "Stop and request explicit user approval first."
         )
     return None
+
+
+def _validate_plan_gate(plan_file: Path, prompt_ts: float | None) -> str | None:
+    """Validate plan existence, required task fields (`Agent:`, `Files:`), and Approval Gate 2."""
+    if not plan_file.is_file():
+        return f"Paddock plan-gate: plan not found: {plan_file}"
+    text = plan_file.read_text(encoding="utf-8", errors="replace")
+    if "Agent:" not in text or "Files:" not in text:
+        return f"Paddock plan-gate: plan '{plan_file.name}' must include 'Agent:' and 'Files:'."
+    return _check_approval_gate(plan_file, prompt_ts, "Approval Gate 2")
 
 
 def _validate_git_mode(prompt: str) -> str | None:
@@ -514,6 +564,30 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 return _allow_with_context("\n".join(lines))
         return {}
 
+    mcp_match = WORKTREE_MCP_TOOL_RE.fullmatch(tool_name)
+    if mcp_match:
+        mcp_tool = mcp_match.group(1)
+        if mcp_tool == "worktree_list":
+            return {}
+        if mcp_tool == "worktree_create":
+            raw_plan = tool_input.get("plan_path")
+            if isinstance(raw_plan, str) and raw_plan.strip():
+                arg_cwd = _resolve_dir_arg(tool_input.get("cwd"), cwd)
+                p = Path(raw_plan.strip())
+                plan_file = p.resolve() if p.is_absolute() else _resolve_relative_candidate(p, cwd, arg_cwd)
+                prompt_ts = _last_prompt_ts(payload.get("session_id"))
+                err = _validate_plan_gate(plan_file, prompt_ts)
+                if err:
+                    return _deny(err)
+            return {}
+        if mcp_tool == "worktree_remove":
+            slug = str(tool_input.get("slug") or "").strip()
+            delete_branch = bool(tool_input.get("delete_branch", False))
+            return _ask(
+                f"Confirm removing worktree '.worktrees/{slug}' "
+                f"(delete_branch={delete_branch}). Non-force only."
+            )
+
     if tool_name == "Agent":
         subagent_type = str(tool_input.get("subagent_type") or "")
         role = _normalize_role(subagent_type)
@@ -536,12 +610,9 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 return _deny("Paddock plan-gate: planner requires an approved docs/specs/<file>.md (or existing plan).")
         elif role == "builder":
             plan_file = _resolve_doc_ref(cwd, prompt, "plans")
-            if plan_file is None or not plan_file.is_file():
+            if plan_file is None:
                 return _deny("Paddock plan-gate: builder requires a named existing docs/plans/<file>.md.")
-            text = plan_file.read_text(encoding="utf-8", errors="replace")
-            if "Agent:" not in text or "Files:" not in text:
-                return _deny(f"Paddock plan-gate: plan '{plan_file.name}' must include 'Agent:' and 'Files:'.")
-            err = _check_approval_gate(plan_file, prompt_ts, "Approval Gate 2")
+            err = _validate_plan_gate(plan_file, prompt_ts)
             if err:
                 return _deny(err)
         else:
@@ -553,12 +624,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                     "or reference an approved docs/plans/<file>.md."
                 )
             if plan_file is not None and not mode_match:
-                if not plan_file.is_file():
-                    return _deny(f"Paddock plan-gate: plan not found: {plan_file}")
-                text = plan_file.read_text(encoding="utf-8", errors="replace")
-                if "Agent:" not in text or "Files:" not in text:
-                    return _deny(f"Paddock plan-gate: plan '{plan_file.name}' must include 'Agent:' and 'Files:'.")
-                err = _check_approval_gate(plan_file, prompt_ts, "Approval Gate 2")
+                err = _validate_plan_gate(plan_file, prompt_ts)
                 if err:
                     return _deny(err)
             if mode_match and mode_match.group(1).lower() == "git":
