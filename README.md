@@ -167,6 +167,28 @@ On **Antigravity**, `paddock models show --platform antigravity` reports both di
 
 On Claude Code, `apply` writes global defaults into installed static `agents/*.md` profiles, while `claude_hooks.py` reports effective `model/effort` at `SessionStart` and surfaces project-level override mismatches via non-blocking `additionalContext` on `PreToolUse` (`Agent`).
 
+## Worktree Isolation (`paddock-worktree` MCP & `paddock worktree` CLI)
+
+Paddock enforces GitHub Flow via `branch-guard` (`PreToolUse` hooks block direct code edits on `main`/`master`). When agent terminal sandboxes restrict writes to `.git/`, the host-side `paddock-worktree` stdio MCP server (`worktree_create`, `worktree_list`, `worktree_remove`) and `paddock worktree` CLI provide non-force `.worktrees/<slug>` lifecycle management:
+
+- **Orchestrator & cheap-model routing:** After Gate 2 approval, the main orchestrator calls `worktree_create` directly (or delegates to fast-tier, shell-free `generalist` with `mcp` capability) and passes the returned `worktree_path` into Antigravity `workflows/build_plan.py` (`Args.worktree`), `swarm`, or Claude `builder`.
+- **Turnkey setup (`worktree_create`):** Adds `.worktrees/` to local `.git/info/exclude` (never tracked `.gitignore`), idempotently creates or reuses `.worktrees/<slug>` on `<prefix>/<slug>`, copies matching untracked `docs/specs/<slug>*.md`, `docs/plans/<slug>*.md`, and optional `plan_path`/`copy_paths` preserving `mtime` (with Gate 2 checked when `plan_path` is passed), and runs non-fatal `codegraph init -y` if `.codegraph/` exists.
+- **Non-force removal (`worktree_remove`):** Always triggers a `PreToolUse` `ask` confirmation prompt on both platforms, refuses dirty, untracked, main, or external checkouts, and uses non-force `git branch -d` when `delete_branch=true` (never `--force` or `-D`).
+- **CLI parity/fallback (`paddock worktree ...`):**
+  ```bash
+  # Idempotently create or reuse .worktrees/<slug> on <prefix>/<slug> (auto-copies matching untracked specs/plans)
+  paddock worktree create <slug> --prefix feat --plan-path docs/plans/<slug>.md --json
+
+  # Optional flags: --base REF, --copy PATH ..., --no-codegraph, --cwd DIR
+  paddock worktree create <slug> --base main --copy notes.md --no-codegraph
+
+  # List registered git worktrees and Paddock-managed slugs
+  paddock worktree list --cwd /path/to/repo --json
+
+  # Non-force remove .worktrees/<slug> and optionally delete merged branch via `git branch -d`
+  paddock worktree remove <slug> --delete-branch --cwd /path/to/repo --json
+  ```
+
 ## Development
 
 Contributors working on Paddock itself can clone the repository and run sync, version parity, and test checks locally:
@@ -189,6 +211,9 @@ paddock/
 │   ├── config/
 │   │   ├── models.py                 # Versioned multi-provider model config engine & CLI
 │   │   └── agents.py                 # Canonical agent parser, compiler, & apply helper
+│   ├── git/
+│   │   ├── worktree.py               # Git worktree isolation, exclude, & non-force cleanup
+│   │   └── worktree_mcp_server.py    # Zero-dependency stdlib JSON-RPC 2.0 `paddock-worktree` MCP
 │   ├── memory/
 │   │   ├── memory.py                 # Typed memory engine, validator, & indexer (MCP/internal)
 │   │   └── mcp_server.py             # Zero-dependency stdlib JSON-RPC 2.0 stdio MCP server
@@ -214,7 +239,7 @@ paddock/
 
 ### Sync, Parity, and Tests
 
-- **Sync core skills, `paddock_core/`, compiled agents, and check SemVer parity across `pyproject.toml`, `paddock/__init__.py`, plugin manifests, and `mcp_server.py`:**
+- **Sync core skills, `paddock_core/`, compiled agents, and check SemVer parity across `pyproject.toml`, `paddock/__init__.py`, plugin manifests, `mcp_server.py`, and `worktree_mcp_server.py`:**
   ```bash
   python scripts/sync.py
   python scripts/sync.py --check

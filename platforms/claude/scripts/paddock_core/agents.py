@@ -88,6 +88,7 @@ VALID_CAPABILITIES: tuple[str, ...] = (
     "search",
     "web",
     "delegate",
+    "mcp",
 )
 REQUIRED_FRONTMATTER_KEYS: tuple[str, ...] = (
     "name",
@@ -109,6 +110,7 @@ CAPABILITY_TOOL_MAP: dict[str, dict[str, tuple[str, ...]]] = {
         "search": (),
         "web": ("search_web",),
         "delegate": (),
+        "mcp": ("call_mcp_tool",),
     },
     "claude": {
         "read": ("Read",),
@@ -119,6 +121,11 @@ CAPABILITY_TOOL_MAP: dict[str, dict[str, tuple[str, ...]]] = {
         "search": ("Grep", "Glob"),
         "web": ("WebFetch", "WebSearch"),
         "delegate": ("Agent",),
+        "mcp": (
+            "mcp__plugin_paddock_paddock-worktree__worktree_create",
+            "mcp__plugin_paddock_paddock-worktree__worktree_list",
+            "mcp__plugin_paddock_paddock-worktree__worktree_remove",
+        ),
     },
 }
 

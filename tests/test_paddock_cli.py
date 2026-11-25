@@ -439,7 +439,7 @@ def test_models_delegation_and_memory_absent_from_public_cli(
         action for action in parser._actions if hasattr(action, "choices") and isinstance(action.choices, dict)
     ]
     assert len(sub_actions) == 1
-    assert set(sub_actions[0].choices) == {"install", "uninstall", "update", "status", "models"}
+    assert set(sub_actions[0].choices) == {"install", "uninstall", "update", "status", "models", "worktree"}
     assert "memory" not in sub_actions[0].choices
 
     assert cli.main(["memory"]) != 0
@@ -448,7 +448,7 @@ def test_models_delegation_and_memory_absent_from_public_cli(
 
     assert cli.main(["--help"]) == 0
     top_help = capsys.readouterr().out
-    assert "{install,uninstall,update,status,models}" in top_help
+    assert "{install,uninstall,update,status,models,worktree}" in top_help
 
 
 def test_wheel_bundle_fallback_and_verify_bundle_integrity(
@@ -489,15 +489,20 @@ def test_wheel_bundle_fallback_and_verify_bundle_integrity(
     for rel_missing in (
         "platforms/antigravity/plugin.json",
         "platforms/antigravity/scripts/paddock_core/mcp_server.py",
+        "platforms/antigravity/scripts/paddock_core/worktree.py",
+        "platforms/antigravity/scripts/paddock_core/worktree_mcp_server.py",
         "platforms/claude/.claude-plugin/plugin.json",
         ".claude-plugin/marketplace.json",
         "platforms/claude/scripts/paddock_core/agents.py",
+        "platforms/claude/scripts/paddock_core/worktree.py",
+        "platforms/claude/scripts/paddock_core/worktree_mcp_server.py",
         "core/skills/paddock-models/SKILL.md",
     ):
         broken_bundle = _build_bundle_tree(tmp_path / f"broken_{rel_missing.replace('/', '_')}")
         (broken_bundle / rel_missing).unlink()
-        with pytest.raises(FileNotFoundError, match="Incomplete Paddock bundle"):
+        with pytest.raises(FileNotFoundError, match="Incomplete Paddock bundle") as exc_info:
             installer.verify_bundle_integrity(broken_bundle)
+        assert rel_missing in str(exc_info.value)
 
     # Missing core/agents/*.md is also caught
     no_agents_bundle = _build_bundle_tree(tmp_path / "broken_no_agents")
@@ -882,3 +887,271 @@ def test_backward_compatible_script_wrappers(
         check=True,
     )
     assert json.loads(models_proc.stdout)["effective_preset"] == "balanced"
+
+
+def _git_in(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        shell=False,
+    )
+
+
+def _init_git_repo(path: Path, *, branch: str = "main") -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _git_in(path, "init", "-b", branch)
+    _git_in(path, "config", "user.name", "Test User")
+    _git_in(path, "config", "user.email", "test@example.com")
+    (path / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+    _git_in(path, "add", "README.md")
+    _git_in(path, "commit", "-m", "initial commit")
+    return path
+
+
+def test_worktree_cli_help_create_and_list(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["worktree", "--help"]) == 0
+    wt_help = capsys.readouterr().out
+    for subcmd in ("create", "list", "remove"):
+        assert subcmd in wt_help
+
+    help_proc = subprocess.run(
+        [sys.executable, "-m", "paddock.cli", "worktree", "--help"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=True,
+        shell=False,
+    )
+    for subcmd in ("create", "list", "remove"):
+        assert subcmd in help_proc.stdout
+
+    repo = _init_git_repo(tmp_path / "repo")
+    _git_in(repo, "branch", "base-dev")
+    (repo / "README.md").write_text("# Updated Main\n", encoding="utf-8")
+    _git_in(repo, "add", "README.md")
+    _git_in(repo, "commit", "-m", "second commit on main")
+
+    # Source .codegraph dir lets --no-codegraph distinguish skipped_disabled vs skipped_no_source_index
+    (repo / ".codegraph").mkdir()
+
+    plan_file = repo / "docs" / "plans" / "feature-one.md"
+    plan_file.parent.mkdir(parents=True)
+    plan_file.write_text("# Plan\n\nApproved.\n", encoding="utf-8")
+
+    notes_dir = repo / "notes"
+    notes_dir.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (notes_dir / name).write_text(f"note {name}\n", encoding="utf-8")
+
+    # Create with --prefix, --base, --plan-path, multi-arg + repeated --copy, --no-codegraph, --json
+    assert (
+        cli.main(
+            [
+                "worktree",
+                "create",
+                "feature-one",
+                "--prefix",
+                "fix",
+                "--base",
+                "base-dev",
+                "--plan-path",
+                "docs/plans/feature-one.md",
+                "--copy",
+                "notes/a.txt",
+                "notes/b.txt",
+                "--copy",
+                "notes/c.txt",
+                "--no-codegraph",
+                "--cwd",
+                str(repo),
+                "--json",
+            ]
+        )
+        == 0
+    )
+    created_json = json.loads(capsys.readouterr().out)
+    wt_one = (repo / ".worktrees" / "feature-one").resolve()
+    assert Path(created_json["repo_root"]) == repo.resolve()
+    assert Path(created_json["worktree_path"]) == wt_one
+    assert created_json["branch"] == "fix/feature-one"
+    assert created_json["base"] == "base-dev"
+    assert created_json["created"] is True
+    assert created_json["reused"] is False
+    assert created_json["exclude_updated"] is True
+    assert created_json["codegraph_status"] == "skipped_disabled"
+    assert set(created_json["copied_files"]) == {
+        "docs/plans/feature-one.md",
+        "notes/a.txt",
+        "notes/b.txt",
+        "notes/c.txt",
+    }
+    assert _git_in(wt_one, "rev-parse", "HEAD").stdout.strip() == _git_in(repo, "rev-parse", "base-dev").stdout.strip()
+    assert (wt_one / "docs" / "plans" / "feature-one.md").read_text(encoding="utf-8") == "# Plan\n\nApproved.\n"
+    for name in ("a.txt", "b.txt", "c.txt"):
+        assert (wt_one / "notes" / name).read_text(encoding="utf-8") == f"note {name}\n"
+
+    # Idempotent reuse in human-readable text mode
+    assert (
+        cli.main(
+            [
+                "worktree",
+                "create",
+                "feature-one",
+                "--prefix",
+                "fix",
+                "--no-codegraph",
+                "--cwd",
+                str(repo),
+            ]
+        )
+        == 0
+    )
+    reuse_text = capsys.readouterr().out
+    assert "Reused worktree:" in reuse_text
+    assert "fix/feature-one" in reuse_text
+    assert "CodeGraph: skipped_disabled" in reuse_text
+
+    # Second worktree with default prefix & base in human-readable text mode
+    assert (
+        cli.main(
+            [
+                "worktree",
+                "create",
+                "text-wt",
+                "--no-codegraph",
+                "--cwd",
+                str(repo),
+            ]
+        )
+        == 0
+    )
+    create_text = capsys.readouterr().out
+    assert "Created worktree:" in create_text
+    assert "branch: feat/text-wt" in create_text
+    assert "base: main" in create_text
+    assert "CodeGraph: skipped_disabled" in create_text
+
+    # List --json and text output
+    assert cli.main(["worktree", "list", "--cwd", str(repo), "--json"]) == 0
+    list_json = json.loads(capsys.readouterr().out)
+    assert Path(list_json["repo_root"]) == repo.resolve()
+    by_slug = {entry["slug"]: entry for entry in list_json["worktrees"]}
+    assert set(by_slug) == {None, "feature-one", "text-wt"}
+    assert by_slug[None]["is_main"] is True
+    assert by_slug["feature-one"]["is_paddock_managed"] is True
+    assert by_slug["feature-one"]["branch"] == "fix/feature-one"
+    assert by_slug["text-wt"]["branch"] == "feat/text-wt"
+
+    assert cli.main(["worktree", "list", "--cwd", str(repo)]) == 0
+    list_text = capsys.readouterr().out
+    assert "Repository:" in list_text
+    assert "[main]" in list_text
+    assert "fix/feature-one" in list_text
+    assert "[paddock:feature-one]" in list_text
+    assert "feat/text-wt" in list_text
+    assert "[paddock:text-wt]" in list_text
+
+
+def test_worktree_cli_remove_and_error_paths(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+
+    # 1. Remove without --delete-branch keeps branch (text output)
+    assert cli.main(["worktree", "create", "keep-branch", "--no-codegraph", "--cwd", str(repo)]) == 0
+    capsys.readouterr()
+    assert cli.main(["worktree", "remove", "keep-branch", "--cwd", str(repo)]) == 0
+    rm_keep_out = capsys.readouterr().out
+    assert "Removed worktree:" in rm_keep_out
+    assert "keep-branch" in rm_keep_out
+    assert "Deleted branch:" not in rm_keep_out
+    assert _git_in(repo, "show-ref", "--verify", "--quiet", "refs/heads/feat/keep-branch", check=False).returncode == 0
+
+    # 2. Clean --delete-branch succeeds (--json and text)
+    assert cli.main(["worktree", "create", "merged-json", "--no-codegraph", "--cwd", str(repo)]) == 0
+    capsys.readouterr()
+    assert cli.main(["worktree", "remove", "merged-json", "--delete-branch", "--cwd", str(repo), "--json"]) == 0
+    rm_merged_json = json.loads(capsys.readouterr().out)
+    assert rm_merged_json["removed"] is True
+    assert rm_merged_json["branch"] == "feat/merged-json"
+    assert rm_merged_json["branch_deleted"] is True
+    assert rm_merged_json["branch_delete_warning"] is None
+    assert _git_in(repo, "show-ref", "--verify", "--quiet", "refs/heads/feat/merged-json", check=False).returncode != 0
+
+    assert cli.main(["worktree", "create", "merged-text", "--no-codegraph", "--cwd", str(repo)]) == 0
+    capsys.readouterr()
+    assert cli.main(["worktree", "remove", "merged-text", "--delete-branch", "--cwd", str(repo)]) == 0
+    rm_merged_text = capsys.readouterr().out
+    assert "Removed worktree:" in rm_merged_text
+    assert "Deleted branch: feat/merged-text" in rm_merged_text
+    assert "Warning:" not in rm_merged_text
+
+    # 3. Unmerged --delete-branch removes worktree cleanly and emits branch_delete_warning
+    for slug, use_json in (("unmerged-json", True), ("unmerged-text", False)):
+        assert cli.main(["worktree", "create", slug, "--no-codegraph", "--cwd", str(repo)]) == 0
+        capsys.readouterr()
+        wt_path = repo / ".worktrees" / slug
+        (wt_path / "feature.txt").write_text("unmerged work\n", encoding="utf-8")
+        _git_in(wt_path, "add", "feature.txt")
+        _git_in(wt_path, "commit", "-m", f"unmerged commit on {slug}")
+
+        args = ["worktree", "remove", slug, "--delete-branch", "--cwd", str(repo)]
+        if use_json:
+            args.append("--json")
+        assert cli.main(args) == 0
+        out = capsys.readouterr().out
+        if use_json:
+            payload = json.loads(out)
+            assert payload["removed"] is True
+            assert payload["branch_deleted"] is False
+            assert payload["branch_delete_warning"]
+        else:
+            assert "Removed worktree:" in out
+            assert "Warning:" in out
+            assert "not fully merged" in out
+        assert not wt_path.exists()
+        assert _git_in(repo, "show-ref", "--verify", "--quiet", f"refs/heads/feat/{slug}", check=False).returncode == 0
+
+    # 4. Dirty worktree removal is refused (exit 1 in both text and --json modes)
+    assert cli.main(["worktree", "create", "dirty-wt", "--no-codegraph", "--cwd", str(repo)]) == 0
+    capsys.readouterr()
+    dirty_wt = repo / ".worktrees" / "dirty-wt"
+    (dirty_wt / "untracked.txt").write_text("dirty\n", encoding="utf-8")
+
+    assert cli.main(["worktree", "remove", "dirty-wt", "--cwd", str(repo)]) == 1
+    assert "error:" in capsys.readouterr().err
+    assert dirty_wt.is_dir()
+
+    assert cli.main(["worktree", "remove", "dirty-wt", "--cwd", str(repo), "--json"]) == 1
+    dirty_err_json = json.loads(capsys.readouterr().err)
+    assert "error" in dirty_err_json
+    assert dirty_wt.is_dir()
+
+    # 5. Invalid slug, invalid prefix, and non-git directory errors exit 1
+    assert cli.main(["worktree", "create", "../escape", "--cwd", str(repo)]) == 1
+    assert "error:" in capsys.readouterr().err
+
+    assert cli.main(["worktree", "create", "BadSlug", "--cwd", str(repo), "--json"]) == 1
+    bad_slug_json = json.loads(capsys.readouterr().err)
+    assert "Invalid worktree slug" in bad_slug_json["error"]
+
+    assert cli.main(["worktree", "remove", "bad/slug", "--cwd", str(repo)]) == 1
+    assert "error:" in capsys.readouterr().err
+
+    assert cli.main(["worktree", "create", "valid-slug", "--prefix", "bogus", "--cwd", str(repo)]) == 1
+    assert "Invalid branch prefix" in capsys.readouterr().err
+
+    non_git = tmp_path / "plain_dir"
+    non_git.mkdir()
+    assert cli.main(["worktree", "list", "--cwd", str(non_git)]) == 1
+    assert "Not a git repository" in capsys.readouterr().err

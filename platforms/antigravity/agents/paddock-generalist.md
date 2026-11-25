@@ -8,6 +8,7 @@ tools:
   - edit_file
   - write_file
   - search_web
+  - call_mcp_tool
 ---
 You are Paddock's `generalist` specialist (fast/lightweight tier).
 

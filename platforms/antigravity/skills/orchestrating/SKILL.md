@@ -1,6 +1,6 @@
 ---
 name: orchestrating
-description: Antigravity Paddock orchestrator runbook for two-lane routing, approval gates, exact-model swarm dispatch, deterministic workflows/build_plan.py dispatch, and Mode: git writes.
+description: "Antigravity Paddock orchestrator runbook for two-lane routing, approval gates, paddock-worktree MCP isolation, exact-model swarm dispatch, deterministic workflows/build_plan.py dispatch, and Mode: git writes."
 ---
 
 # Paddock Orchestrating (Antigravity)
@@ -26,10 +26,15 @@ Model profiles live in `~/.paddock/models.json` and optional per-project `~/.pad
   3. Present spec with `RequestFeedback: true` and **STOP (User Approval Gate 1)**.
   4. Dispatch `planner` (`invoke_subagent` `paddock-planner` or `swarm` `planner`) pointing to the approved spec path to produce `docs/plans/<slug>.md`.
   5. Review the plan against the spec, present it to the user, and **STOP (User Approval Gate 2)**.
-  6. Execute `platforms/antigravity/workflows/build_plan.py` via `run_workflow` with `Args={"plan_path": "docs/plans/<slug>.md", ...}` (optionally passing `Args.models` overrides) — or dispatch `swarm` workers referencing the approved plan for parallel exact-model tasks.
-  7. Report one concise final summary quoting verifier evidence.
+  6. Call `paddock_paddock-worktree` (`worktree_create`) directly (or delegate to fast-tier, shell-free `generalist`) to create/reuse `.worktrees/<slug>`, copy untracked specs/plans preserving `mtime`, and obtain `worktree_path`.
+  7. Execute `platforms/antigravity/workflows/build_plan.py` via `run_workflow` with `Args={"plan_path": "docs/plans/<slug>.md", "worktree": "<worktree_path>", ...}` (optionally passing `Args.models` overrides) — or dispatch `swarm` workers referencing `worktree_path` and the approved plan for parallel exact-model tasks.
+  8. Report one concise final summary quoting verifier evidence.
 
-## 3. Worktree & Git Writes (`Mode: git`)
+## 3. Worktree MCP Lifecycle & Git Writes (`Mode: git`)
 
-- Dispatch `implementer` (`Mode: git` via `swarm` or `invoke_subagent` `paddock-implementer`) for all git writes (worktree setup `.worktrees/<slug>` with `.git/info/exclude`, commits from intent only, PR creation via `gh pr create`, `gh pr merge --merge`, and post-merge cleanup).
+- **Worktree MCP (`paddock_paddock-worktree`):** Main orchestrator calls `worktree_create`, `worktree_list`, and `worktree_remove` directly (or delegates to fast-tier `generalist`, which keeps `shell` disallowed).
+  - `worktree_create` updates `.git/info/exclude` (never tracked `.gitignore`), idempotently creates or reuses `.worktrees/<slug>` on `<prefix>/<slug>`, copies matching untracked specs/plans preserving `mtime` (enforcing Gate 2 when `plan_path` is passed), and runs non-fatal `codegraph init -y` if `.codegraph/` exists.
+  - `worktree_remove` always triggers a `PreToolUse` `ask` confirmation prompt and stays strictly non-force (`git worktree remove` + optional `git branch -d` only; never `--force` or `-D`).
+- **CLI parity/fallback:** Use `paddock worktree <create|list|remove>` (`--json`) when running outside MCP.
+- **Commits, PRs & merges (`Mode: git`):** Dispatch `implementer` (`Mode: git` via `swarm` or `invoke_subagent` `paddock-implementer`) for commits from intent only, PR creation via `gh pr create`, `gh pr merge --merge`, and post-merge `git pull --ff-only`.
 - Never pass `--tags`, `--follow-tags`, `branch -D`, or `worktree remove --force` without explicit user approval.

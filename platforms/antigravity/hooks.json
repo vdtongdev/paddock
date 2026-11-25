@@ -27,6 +27,16 @@
             "timeout": 15
           }
         ]
+      },
+      {
+        "matcher": "call_mcp_tool",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "uv run --no-project --script scripts/agy_hooks.py PreToolUse",
+            "timeout": 15
+          }
+        ]
       }
     ],
     "Stop": [

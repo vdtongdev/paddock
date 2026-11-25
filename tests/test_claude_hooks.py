@@ -587,3 +587,183 @@ def test_claude_hooks_corrupt_models_json_fails_open(tmp_path: Path) -> None:
         plugin_data,
     )
     assert deny_git["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_claude_hooks_json_includes_worktree_mcp_matcher() -> None:
+    hooks_cfg = json.loads(
+        (REPO_ROOT / "platforms" / "claude" / "hooks" / "hooks.json").read_text(encoding="utf-8")
+    )
+    pre_entries = hooks_cfg["hooks"]["PreToolUse"]
+    matched = [entry for entry in pre_entries if entry.get("matcher") == "mcp__.*paddock-worktree__.*"]
+    assert len(matched) == 1
+    hook = matched[0]["hooks"][0]
+    assert "claude_hooks.py" in hook["command"]
+    assert "claude_hooks.py" in hook["commandWindows"]
+    assert hook["timeout"] == 15
+
+
+def test_worktree_mcp_pre_tool_use_routing_gates_and_ask(tmp_path: Path) -> None:
+    paddock_home = tmp_path / "paddock"
+    plugin_data = tmp_path / "plugin-data"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    wt = repo / ".worktrees" / "wt-c"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "feat/wt-c", str(wt)],
+        check=True,
+        capture_output=True,
+    )
+
+    plans_dir = repo / "docs" / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    approved_plan = plans_dir / "approved.md"
+    unapproved_plan = plans_dir / "unapproved.md"
+    malformed_plan = plans_dir / "malformed.md"
+    approved_plan.write_text("### Task 1\n- Agent: implementer\n- Files: a.py\n", encoding="utf-8")
+    unapproved_plan.write_text("### Task 1\n- Agent: implementer\n- Files: a.py\n", encoding="utf-8")
+    malformed_plan.write_text("### Task 1\nNo fields\n", encoding="utf-8")
+
+    _run_hook("user-prompt-submit", {"session_id": "s-wt", "cwd": str(repo)}, paddock_home, plugin_data)
+    past = time.time() - 120.0
+    future = time.time() + 120.0
+    os.utime(approved_plan, (past, past))
+    os.utime(malformed_plan, (past, past))
+    os.utime(unapproved_plan, (future, future))
+
+    # worktree_list -> {}
+    assert (
+        _run_hook(
+            "pre-tool-use",
+            {
+                "session_id": "s-wt",
+                "cwd": str(repo),
+                "tool_name": "mcp__plugin_paddock_paddock-worktree__worktree_list",
+                "tool_input": {"cwd": str(repo)},
+            },
+            paddock_home,
+            plugin_data,
+        )
+        == {}
+    )
+
+    # worktree_create without plan_path -> {}
+    for extra in ({}, {"plan_path": ""}):
+        assert (
+            _run_hook(
+                "pre-tool-use",
+                {
+                    "session_id": "s-wt",
+                    "cwd": str(repo),
+                    "tool_name": "mcp__plugin_paddock_paddock-worktree__worktree_create",
+                    "tool_input": {"cwd": str(repo), "slug": "wt-new", **extra},
+                },
+                paddock_home,
+                plugin_data,
+            )
+            == {}
+        )
+
+    # worktree_create missing / malformed / unapproved plan_path -> deny
+    for bad_plan, expected_substr in (
+        ("docs/plans/missing.md", "plan not found"),
+        ("docs/plans/malformed.md", "Agent:"),
+        ("docs/plans/unapproved.md", "Approval Gate 2"),
+    ):
+        denied = _run_hook(
+            "pre-tool-use",
+            {
+                "session_id": "s-wt",
+                "cwd": str(repo),
+                "tool_name": "mcp__plugin_paddock_paddock-worktree__worktree_create",
+                "tool_input": {"cwd": str(repo), "slug": "wt-new", "plan_path": bad_plan},
+            },
+            paddock_home,
+            plugin_data,
+        )
+        out = denied["hookSpecificOutput"]
+        assert out["hookEventName"] == "PreToolUse"
+        assert out["permissionDecision"] == "deny"
+        assert expected_substr in out["permissionDecisionReason"]
+
+    # worktree_create approved relative plan_path resolved via tool_input.cwd (payload.cwd differs) -> {}
+    assert (
+        _run_hook(
+            "pre-tool-use",
+            {
+                "session_id": "s-wt",
+                "cwd": str(tmp_path),
+                "tool_name": "mcp__plugin_paddock_paddock-worktree__worktree_create",
+                "tool_input": {"cwd": str(repo), "slug": "wt-new", "plan_path": "docs/plans/approved.md"},
+            },
+            paddock_home,
+            plugin_data,
+        )
+        == {}
+    )
+
+    # worktree_create relative plan_path resolved via repo_root fallback when payload.cwd is worktree
+    assert (
+        _run_hook(
+            "pre-tool-use",
+            {
+                "session_id": "s-wt",
+                "cwd": str(wt),
+                "tool_name": "mcp__plugin_paddock_paddock-worktree__worktree_create",
+                "tool_input": {"slug": "wt-new", "plan_path": "docs/plans/approved.md"},
+            },
+            paddock_home,
+            plugin_data,
+        )
+        == {}
+    )
+
+    # worktree_remove -> ask with .worktrees/<slug> and delete_branch=<bool>
+    ask_default = _run_hook(
+        "pre-tool-use",
+        {
+            "session_id": "s-wt",
+            "cwd": str(repo),
+            "tool_name": "mcp__plugin_paddock_paddock-worktree__worktree_remove",
+            "tool_input": {"cwd": str(repo), "slug": "wt-c"},
+        },
+        paddock_home,
+        plugin_data,
+    )
+    out_default = ask_default["hookSpecificOutput"]
+    assert out_default["hookEventName"] == "PreToolUse"
+    assert out_default["permissionDecision"] == "ask"
+    assert ".worktrees/wt-c" in out_default["permissionDecisionReason"]
+    assert "delete_branch=False" in out_default["permissionDecisionReason"]
+
+    ask_del = _run_hook(
+        "pre-tool-use",
+        {
+            "session_id": "s-wt",
+            "cwd": str(repo),
+            "tool_name": "mcp__paddock-worktree__worktree_remove",
+            "tool_input": {"cwd": str(repo), "slug": "wt-c", "delete_branch": True},
+        },
+        paddock_home,
+        plugin_data,
+    )
+    out_del = ask_del["hookSpecificOutput"]
+    assert out_del["hookEventName"] == "PreToolUse"
+    assert out_del["permissionDecision"] == "ask"
+    assert ".worktrees/wt-c" in out_del["permissionDecisionReason"]
+    assert "delete_branch=True" in out_del["permissionDecisionReason"]
+
+    # Unrelated MCP tool -> {}
+    assert (
+        _run_hook(
+            "pre-tool-use",
+            {
+                "session_id": "s-wt",
+                "cwd": str(repo),
+                "tool_name": "mcp__plugin_paddock_paddock-mem__mem_write",
+                "tool_input": {"cwd": str(repo)},
+            },
+            paddock_home,
+            plugin_data,
+        )
+        == {}
+    )

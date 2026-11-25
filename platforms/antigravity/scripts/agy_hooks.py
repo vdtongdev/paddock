@@ -61,6 +61,7 @@ SPEC_REF_RE = re.compile(r"docs[/\\]specs[/\\]([A-Za-z0-9._-]+\.md)")
 PLAN_REF_RE = re.compile(r"docs[/\\]plans[/\\]([A-Za-z0-9._-]+\.md)")
 PATH_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.:/-])([A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.*-]+)+)")
 MODE_RE = re.compile(r"\bMode:\s*(quick|diagnose|git|lookup)\b", re.IGNORECASE)
+WORKTREE_MCP_SERVERS = frozenset({"paddock_paddock-worktree", "paddock-worktree"})
 
 
 def default_response(event: str) -> dict[str, Any]:
@@ -188,18 +189,53 @@ def _extract_path_candidates(text: str) -> list[str]:
     return list(dict.fromkeys(paths))
 
 
-def _resolve_doc_ref(cwd: Path, text: str, kind: str) -> Path | None:
+def _resolve_relative_candidate(
+    rel: Path,
+    cwd: Path,
+    *priority_bases: Path | None,
+) -> Path:
+    """Resolve relative `rel` across priority bases, `cwd`, and git `repo_root`."""
+    bases: list[Path] = []
+    for base in (*priority_bases, cwd):
+        if base is not None:
+            resolved = base.resolve()
+            if resolved not in bases:
+                bases.append(resolved)
+    for base in list(bases):
+        root = memory.resolve_repo_root(base)
+        if root not in bases:
+            bases.append(root)
+    for base in bases:
+        cand = (base / rel).resolve()
+        if cand.exists():
+            return cand
+    fallback = bases[0] if bases else cwd.resolve()
+    return (fallback / rel).resolve()
+
+
+def _resolve_dir_arg(raw_dir: Any, cwd: Path) -> Path | None:
+    """Resolve an optional directory argument against `cwd` and git `repo_root`."""
+    if not isinstance(raw_dir, str) or not raw_dir.strip():
+        return None
+    p = Path(raw_dir.strip()).expanduser()
+    if p.is_absolute():
+        return p.resolve()
+    return _resolve_relative_candidate(p, cwd)
+
+
+def _resolve_doc_ref(
+    cwd: Path,
+    text: str,
+    kind: str,
+    *,
+    priority_base: Path | None = None,
+) -> Path | None:
     pattern = SPEC_REF_RE if kind == "specs" else PLAN_REF_RE
     m = pattern.search(text)
     if not m:
         return None
     rel = Path("docs") / kind / m.group(1)
-    repo_root = memory.resolve_repo_root(cwd)
-    for base in (cwd, repo_root):
-        cand = (base / rel).resolve()
-        if cand.exists():
-            return cand
-    return (cwd / rel).resolve()
+    return _resolve_relative_candidate(rel, cwd, priority_base)
 
 
 def _format_traps_block(cwd: Path, paths: list[str]) -> str:
@@ -357,11 +393,12 @@ def _handle_run_workflow_gate(cwd: Path, args: dict[str, Any], last_user_ts: flo
     if not is_paddock_build:
         return {"decision": "allow"}
 
+    worktree_dir = _resolve_dir_arg(wf_args.get("worktree"), cwd)
     if isinstance(plan_arg, str) and plan_arg.strip():
-        p = Path(plan_arg)
-        plan_file = p.resolve() if p.is_absolute() else (cwd / p).resolve()
+        p = Path(plan_arg.strip())
+        plan_file = p.resolve() if p.is_absolute() else _resolve_relative_candidate(p, cwd, worktree_dir)
     else:
-        plan_file = _resolve_doc_ref(cwd, script_text, "plans")
+        plan_file = _resolve_doc_ref(cwd, script_text, "plans", priority_base=worktree_dir)
 
     if plan_file is None:
         return {
@@ -372,6 +409,49 @@ def _handle_run_workflow_gate(cwd: Path, args: dict[str, Any], last_user_ts: flo
     err = _validate_plan_file(plan_file, last_user_ts)
     if err:
         return {"decision": "deny", "reason": err}
+    return {"decision": "allow"}
+
+
+def _handle_call_mcp_tool_gate(
+    cwd: Path, args: dict[str, Any], last_user_ts: float | None
+) -> dict[str, Any]:
+    """Enforce Approval Gate 2 on `worktree_create` and user confirmation on `worktree_remove`."""
+    server_name = str(args.get("ServerName") or args.get("server_name") or "").strip()
+    if server_name not in WORKTREE_MCP_SERVERS:
+        return {"decision": "allow"}
+
+    mcp_tool = str(args.get("ToolName") or args.get("tool_name") or "").strip()
+    raw_mcp_args = args.get("Arguments")
+    if not isinstance(raw_mcp_args, dict):
+        raw_mcp_args = args.get("arguments")
+    mcp_args = raw_mcp_args if isinstance(raw_mcp_args, dict) else {}
+
+    if mcp_tool == "worktree_list":
+        return {"decision": "allow"}
+
+    if mcp_tool == "worktree_create":
+        raw_plan = mcp_args.get("plan_path")
+        if not isinstance(raw_plan, str) or not raw_plan.strip():
+            return {"decision": "allow"}
+        arg_cwd = _resolve_dir_arg(mcp_args.get("cwd"), cwd)
+        p = Path(raw_plan.strip())
+        plan_file = p.resolve() if p.is_absolute() else _resolve_relative_candidate(p, cwd, arg_cwd)
+        err = _validate_plan_file(plan_file, last_user_ts)
+        if err:
+            return {"decision": "deny", "reason": err}
+        return {"decision": "allow"}
+
+    if mcp_tool == "worktree_remove":
+        slug = str(mcp_args.get("slug") or "").strip()
+        delete_branch = bool(mcp_args.get("delete_branch", False))
+        return {
+            "decision": "ask",
+            "reason": (
+                f"Confirm removing worktree '.worktrees/{slug}' "
+                f"(delete_branch={delete_branch}). Non-force only."
+            ),
+        }
+
     return {"decision": "allow"}
 
 
@@ -513,6 +593,8 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         return _handle_invoke_subagent_gate(cwd, args, last_user_ts)
     if tool_name == "swarm":
         return _handle_swarm_gate(cwd, args, last_user_ts)
+    if tool_name == "call_mcp_tool":
+        return _handle_call_mcp_tool_gate(cwd, args, last_user_ts)
 
     return {"decision": "allow"}
 

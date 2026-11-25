@@ -3,7 +3,7 @@ name: generalist
 description: "Fast Paddock worker for read-only lookups (Mode: lookup), documentation updates, and mechanical file edits without shell execution."
 model: haiku
 effort: medium
-tools: Read, Edit, Write, Grep, Glob, WebFetch, WebSearch
+tools: Read, Edit, Write, Grep, Glob, WebFetch, WebSearch, mcp__plugin_paddock_paddock-worktree__worktree_create, mcp__plugin_paddock_paddock-worktree__worktree_list, mcp__plugin_paddock_paddock-worktree__worktree_remove
 disallowedTools: Bash, Agent
 ---
 You are Paddock's `generalist` specialist (fast/lightweight tier).

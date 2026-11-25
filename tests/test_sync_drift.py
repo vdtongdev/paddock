@@ -94,6 +94,14 @@ def test_sync_detects_drift_and_repairs_without_touching_orchestrating(tmp_path:
     (repo / "platforms" / "claude" / "scripts" / "paddock_core" / "agents.py").write_text(
         "# drifted agents\n", encoding="utf-8"
     )
+    (repo / "platforms" / "antigravity" / "scripts" / "paddock_core" / "worktree.py").write_text(
+        "# drifted worktree\n", encoding="utf-8"
+    )
+    (repo / "platforms" / "claude" / "scripts" / "paddock_core" / "worktree_mcp_server.py").write_text(
+        "# drifted worktree mcp\n", encoding="utf-8"
+    )
+    (repo / "platforms" / "claude" / "scripts" / "paddock_core" / "worktree.py").unlink()
+    (repo / "platforms" / "antigravity" / "scripts" / "paddock_core" / "worktree_mcp_server.py").unlink()
     (repo / "platforms" / "claude" / "scripts" / "paddock_core" / "agents" / "implementer.md").write_text(
         "---\nname: implementer\n---\nDrifted.\n", encoding="utf-8"
     )
@@ -114,10 +122,17 @@ def test_sync_detects_drift_and_repairs_without_touching_orchestrating(tmp_path:
     extra_claude_agent.write_text("leftover", encoding="utf-8")
 
     drift = sync.sync_all(repo, check=True)
-    assert len(drift) == 11
+    assert len(drift) == 15
+    assert any("worktree.py" in item for item in drift)
+    assert any("worktree_mcp_server.py" in item for item in drift)
 
     sync.sync_all(repo, check=False)
     assert sync.sync_all(repo, check=True) == []
+    for plat in ("antigravity", "claude"):
+        for fname in sync.CORE_GIT_FILES:
+            assert (repo / "platforms" / plat / "scripts" / "paddock_core" / fname).read_text(
+                encoding="utf-8"
+            ) == (repo / "core" / "git" / fname).read_text(encoding="utf-8")
     for stale_path in (extra_skill, extra_core_agent, extra_agy_agent, extra_claude_agent):
         assert not stale_path.exists()
     assert "Keep." in (repo / "platforms" / "antigravity" / "skills" / "orchestrating" / "SKILL.md").read_text(
@@ -416,7 +431,14 @@ def test_repo_platforms_have_zero_sync_drift() -> None:
         assert (plat_dir / "skills").is_dir()
         assert (plat_dir / "skills" / "paddock-models" / "SKILL.md").is_file()
         core_dir = plat_dir / "scripts" / "paddock_core"
-        for mod_name in ("memory.py", "mcp_server.py", "models.py", "agents.py"):
+        for mod_name in (
+            "memory.py",
+            "mcp_server.py",
+            "models.py",
+            "agents.py",
+            "worktree.py",
+            "worktree_mcp_server.py",
+        ):
             assert (core_dir / mod_name).is_file()
         for role in CANONICAL_ROLES:
             assert (core_dir / "agents" / f"{role}.md").is_file()
@@ -428,6 +450,32 @@ def test_repo_platforms_have_zero_sync_drift() -> None:
         p.name for p in (REPO_ROOT / "platforms" / "claude" / "agents").iterdir() if p.is_file()
     } == CLAUDE_AGENT_FILES
     assert sync.sync_all(REPO_ROOT, check=True) == []
+
+
+def test_platform_mcp_configs_register_paddock_worktree() -> None:
+    agy_cfg = json.loads(
+        (REPO_ROOT / "platforms" / "antigravity" / "mcp_config.json").read_text(encoding="utf-8")
+    )
+    claude_cfg = json.loads(
+        (REPO_ROOT / "platforms" / "claude" / ".mcp.json").read_text(encoding="utf-8")
+    )
+
+    for cfg, script_prefix in (
+        (agy_cfg, "scripts/paddock_core"),
+        (claude_cfg, "${CLAUDE_PLUGIN_ROOT}/scripts/paddock_core"),
+    ):
+        servers = cfg["mcpServers"]
+        assert "paddock-mem" in servers
+        assert servers["paddock-worktree"] == {
+            "command": "uv",
+            "args": [
+                "run",
+                "--no-project",
+                "--script",
+                f"{script_prefix}/worktree_mcp_server.py",
+            ],
+            "env": {"PYTHONUTF8": "1"},
+        }
 
 
 def _make_version_parity_repo(tmp_path: Path) -> Path:
@@ -460,6 +508,7 @@ def _make_version_parity_repo(tmp_path: Path) -> Path:
 
 
 def test_check_version_parity_passes_on_repo_root() -> None:
+    assert len(sync._VERSION_PARITY_SOURCES) == 10
     assert sync.check_version_parity(REPO_ROOT) == []
 
 
@@ -473,9 +522,12 @@ def test_check_version_parity_passes_on_repo_root() -> None:
         "core/memory/mcp_server.py",
         "platforms/antigravity/scripts/paddock_core/mcp_server.py",
         "platforms/claude/scripts/paddock_core/mcp_server.py",
+        "core/git/worktree_mcp_server.py",
+        "platforms/antigravity/scripts/paddock_core/worktree_mcp_server.py",
+        "platforms/claude/scripts/paddock_core/worktree_mcp_server.py",
     ],
 )
-def test_check_version_parity_catches_mismatch_in_all_seven_locations(
+def test_check_version_parity_catches_mismatch_in_all_ten_locations(
     tmp_path: Path, rel_path: str
 ) -> None:
     repo = _make_version_parity_repo(tmp_path)
