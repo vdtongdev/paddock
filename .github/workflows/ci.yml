@@ -1,0 +1,188 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install test dependencies
+        run: uv pip install --system pytest
+
+      - name: Check core and platform sync parity
+        run: python scripts/sync.py --check
+
+      - name: Run test suite
+        run: python -m pytest -q
+
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Verify wheel bundle contents
+        shell: python
+        run: |
+          from pathlib import Path, PurePosixPath
+          import zipfile
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, f"Expected 1 wheel in dist/, found {wheels}"
+          wheel = wheels[0]
+
+          with zipfile.ZipFile(wheel, "r") as zf:
+              names = zf.namelist()
+
+          name_set = set(names)
+          required_exact = (
+              "paddock/_bundle/.claude-plugin/marketplace.json",
+              "paddock/_bundle/platforms/antigravity/plugin.json",
+              "paddock/_bundle/platforms/claude/.claude-plugin/plugin.json",
+              "paddock/_bundle/core/skills/paddock-models/SKILL.md",
+          )
+          for req in required_exact:
+              assert req in name_set, f"Missing bundled asset {req!r} in {wheel}"
+
+          required_prefixes = (
+              "paddock/_bundle/core/",
+              "paddock/_bundle/platforms/antigravity/",
+              "paddock/_bundle/platforms/claude/",
+          )
+          for prefix in required_prefixes:
+              assert any(name.startswith(prefix) for name in names), (
+                  f"Missing bundled directory {prefix!r} in {wheel}"
+              )
+
+          forbidden_parts = {"__pycache__", ".pytest_cache"}
+          for name in names:
+              parts = PurePosixPath(name).parts
+              assert not any(part in forbidden_parts for part in parts), (
+                  f"Forbidden cache entry in wheel: {name}"
+              )
+              assert not name.endswith((".pyc", ".pyo")), (
+                  f"Forbidden bytecode entry in wheel: {name}"
+              )
+
+          print(f"Verified wheel bundle ({len(names)} entries): {wheel.name}")
+
+      - name: Smoke-test wheel in isolated venv outside workspace
+        shell: python
+        env:
+          WORKSPACE_DIR: ${{ github.workspace }}
+          TEMP_ROOT: ${{ runner.temp }}
+        run: |
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+
+          wheels = sorted(Path("dist").glob("*.whl"))
+          assert len(wheels) == 1, f"Expected 1 wheel in dist/, found {wheels}"
+          wheel_path = wheels[0].resolve()
+
+          workspace_dir = Path(os.environ["WORKSPACE_DIR"]).resolve()
+          temp_root = Path(os.environ["TEMP_ROOT"]).resolve()
+          temp_root.mkdir(parents=True, exist_ok=True)
+
+          uv_bin = shutil.which("uv")
+          assert uv_bin, "uv executable not found on PATH"
+
+          with tempfile.TemporaryDirectory(prefix="paddock-smoke-", dir=temp_root) as tmp:
+              tmp_path = Path(tmp).resolve()
+              assert not tmp_path.is_relative_to(workspace_dir), (
+                  f"Temporary directory {tmp_path} must be outside {workspace_dir}"
+              )
+
+              venv_dir = tmp_path / "venv"
+              work_dir = tmp_path / "work"
+              home_dir = tmp_path / "home"
+              work_dir.mkdir(parents=True, exist_ok=True)
+              home_dir.mkdir(parents=True, exist_ok=True)
+
+              subprocess.run(
+                  [uv_bin, "venv", "--python", sys.executable, str(venv_dir)],
+                  cwd=tmp_path,
+                  check=True,
+              )
+
+              bin_dir = venv_dir / ("Scripts" if os.name == "nt" else "bin")
+              python_bin = bin_dir / ("python.exe" if os.name == "nt" else "python")
+              subprocess.run(
+                  [uv_bin, "pip", "install", "--python", str(python_bin), str(wheel_path)],
+                  cwd=tmp_path,
+                  check=True,
+              )
+
+              paddock_bin = bin_dir / ("paddock.exe" if os.name == "nt" else "paddock")
+              assert paddock_bin.is_file(), f"Missing installed CLI entrypoint: {paddock_bin}"
+
+              env = os.environ.copy()
+              env.pop("PYTHONPATH", None)
+              env["HOME"] = str(home_dir)
+              env["USERPROFILE"] = str(home_dir)
+              env["PADDOCK_HOME"] = str(home_dir / ".paddock")
+
+              version_proc = subprocess.run(
+                  [str(paddock_bin), "--version"],
+                  cwd=work_dir,
+                  env=env,
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              )
+              print(version_proc.stdout.strip())
+
+              status_proc = subprocess.run(
+                  [str(paddock_bin), "status", "--json"],
+                  cwd=work_dir,
+                  env=env,
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              )
+              status_data = json.loads(status_proc.stdout)
+              assert status_data.get("source_mode") == "bundle", (
+                  f"Expected source_mode == 'bundle', got {status_data!r}"
+              )
+              print(
+                  f"status source_mode={status_data['source_mode']} "
+                  f"version={status_data.get('version')}"
+              )
+
+              models_proc = subprocess.run(
+                  [str(paddock_bin), "models", "show", "--json"],
+                  cwd=work_dir,
+                  env=env,
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              )
+              models_data = json.loads(models_proc.stdout)
+              assert isinstance(models_data, dict) and "platforms" in models_data, (
+                  f"Unexpected models show output: {models_data!r}"
+              )
+              print("Out-of-repo wheel smoke test passed")

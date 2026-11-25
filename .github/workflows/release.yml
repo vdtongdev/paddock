@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Validate release tag matches pyproject.toml version
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          pattern = re.compile(r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$")
+          if not pattern.match(tag):
+              raise SystemExit(f"Invalid release tag {tag!r}: must match {pattern.pattern}")
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          project_version = pyproject["project"]["version"]
+          expected_tag = f"v{project_version}"
+          if tag != expected_tag:
+              raise SystemExit(
+                  f"Release tag mismatch: GITHUB_REF_NAME={tag!r} != {expected_tag!r}"
+              )
+          print(f"Validated release tag {tag} matches pyproject.toml version {project_version}")
+
+      - name: Install test dependencies
+        run: uv pip install --system pytest
+
+      - name: Check core and platform sync parity
+        run: python scripts/sync.py --check
+
+      - name: Run test suite
+        run: python -m pytest -q
+
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Build deterministic plugin archives and SHA256SUMS.txt
+        shell: python
+        run: |
+          import hashlib
+          import os
+          from pathlib import Path
+          import zipfile
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          dist_dir = Path("dist")
+          dist_dir.mkdir(parents=True, exist_ok=True)
+
+          fixed_time = (2025, 1, 1, 0, 0, 0)
+          excluded_parts = {"__pycache__", ".pytest_cache"}
+          excluded_suffixes = (".pyc", ".pyo")
+
+          def build_plugin_zip(src_dir: Path, out_zip: Path) -> None:
+              assert src_dir.is_dir(), f"Missing plugin source directory: {src_dir}"
+              files: list[tuple[str, Path]] = []
+              for entry in src_dir.rglob("*"):
+                  if entry.is_symlink():
+                      raise SystemExit(f"Refusing symlink in plugin archive: {entry}")
+                  if not entry.is_file():
+                      continue
+                  rel = entry.relative_to(src_dir)
+                  if any(part in excluded_parts for part in rel.parts):
+                      continue
+                  if entry.name.endswith(excluded_suffixes):
+                      continue
+                  files.append((rel.as_posix(), entry))
+
+              files.sort(key=lambda item: item[0])
+              assert files, f"No files collected from {src_dir}"
+
+              with zipfile.ZipFile(out_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                  for arcname, src_file in files:
+                      zinfo = zipfile.ZipInfo(filename=arcname, date_time=fixed_time)
+                      zinfo.create_system = 3
+                      zinfo.compress_type = zipfile.ZIP_DEFLATED
+                      zinfo.external_attr = (0o100644 & 0xFFFF) << 16
+                      zf.writestr(zinfo, src_file.read_bytes())
+
+          antigravity_zip = dist_dir / f"paddock-antigravity-{tag}.zip"
+          claude_zip = dist_dir / f"paddock-claude-{tag}.zip"
+          build_plugin_zip(Path("platforms/antigravity"), antigravity_zip)
+          build_plugin_zip(Path("platforms/claude"), claude_zip)
+
+          artifacts = sorted(
+              [*dist_dir.glob("*.zip"), *dist_dir.glob("*.whl")],
+              key=lambda p: p.name,
+          )
+          assert len(artifacts) >= 3, f"Expected zips and wheel in dist/, found {artifacts}"
+
+          checksum_lines = [
+              f"{hashlib.sha256(artifact.read_bytes()).hexdigest()}  {artifact.name}"
+              for artifact in artifacts
+          ]
+          (dist_dir / "SHA256SUMS.txt").write_text(
+              "\n".join(checksum_lines) + "\n",
+              encoding="utf-8",
+          )
+          print("Built deterministic release artifacts:")
+          for line in checksum_lines:
+              print(f"  {line}")
+
+      - name: Publish or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.zip dist/*.whl dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.whl dist/SHA256SUMS.txt --verify-tag --generate-notes
+          fi

@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from paddock import installer
 from scripts import install, sync
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -304,6 +308,9 @@ def test_install_claude_discovery_and_explicit_target_apply(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("PADDOCK_HOME", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
+    monkeypatch.setattr(installer.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(install.shutil, "which", lambda _name: None)
     repo = _make_sync_repo(tmp_path)
     (repo / ".claude-plugin").mkdir()
     (repo / ".claude-plugin" / "marketplace.json").write_text('{"name":"paddock"}\n', encoding="utf-8")
@@ -421,3 +428,322 @@ def test_repo_platforms_have_zero_sync_drift() -> None:
         p.name for p in (REPO_ROOT / "platforms" / "claude" / "agents").iterdir() if p.is_file()
     } == CLAUDE_AGENT_FILES
     assert sync.sync_all(REPO_ROOT, check=True) == []
+
+
+def _make_version_parity_repo(tmp_path: Path) -> Path:
+    repo = _make_sync_repo(tmp_path)
+    (repo / "pyproject.toml").write_text(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (repo / "paddock").mkdir(parents=True, exist_ok=True)
+    (repo / "paddock" / "__init__.py").write_text(
+        (REPO_ROOT / "paddock" / "__init__.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    agy_manifest = repo / "platforms" / "antigravity" / "plugin.json"
+    agy_manifest.parent.mkdir(parents=True, exist_ok=True)
+    agy_manifest.write_text(
+        (REPO_ROOT / "platforms" / "antigravity" / "plugin.json").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    claude_manifest = repo / "platforms" / "claude" / ".claude-plugin" / "plugin.json"
+    claude_manifest.parent.mkdir(parents=True, exist_ok=True)
+    claude_manifest.write_text(
+        (REPO_ROOT / "platforms" / "claude" / ".claude-plugin" / "plugin.json").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    sync.sync_all(repo, check=False)
+    return repo
+
+
+def test_check_version_parity_passes_on_repo_root() -> None:
+    assert sync.check_version_parity(REPO_ROOT) == []
+
+
+@pytest.mark.parametrize(
+    "rel_path",
+    [
+        "pyproject.toml",
+        "paddock/__init__.py",
+        "platforms/antigravity/plugin.json",
+        "platforms/claude/.claude-plugin/plugin.json",
+        "core/memory/mcp_server.py",
+        "platforms/antigravity/scripts/paddock_core/mcp_server.py",
+        "platforms/claude/scripts/paddock_core/mcp_server.py",
+    ],
+)
+def test_check_version_parity_catches_mismatch_in_all_seven_locations(
+    tmp_path: Path, rel_path: str
+) -> None:
+    repo = _make_version_parity_repo(tmp_path)
+    assert sync.check_version_parity(repo) == []
+
+    target = repo / rel_path
+    original = target.read_text(encoding="utf-8")
+    if rel_path == "pyproject.toml":
+        mutated = re.sub(r'(?m)^version\s*=\s*"[^"]+"', 'version = "9.9.9"', original, count=1)
+    elif rel_path == "paddock/__init__.py":
+        mutated = re.sub(r'(?m)^__version__\s*=\s*"[^"]+"', '__version__ = "9.9.9"', original, count=1)
+    elif rel_path.endswith(".json"):
+        data = json.loads(original)
+        data["version"] = "9.9.9"
+        mutated = json.dumps(data, indent=2) + "\n"
+    else:
+        mutated = re.sub(
+            r'("version"\s*:\s*)"[^"]+"',
+            r'\g<1>"9.9.9"',
+            original,
+            count=1,
+        )
+    assert mutated != original, rel_path
+    target.write_text(mutated, encoding="utf-8")
+
+    parity_errors = sync.check_version_parity(repo)
+    assert parity_errors, f"Expected version drift for {rel_path}"
+    assert any("version drift" in err and "9.9.9" in err for err in parity_errors)
+    assert any(Path(rel_path).name in err for err in parity_errors)
+
+    sync_errors = sync.sync_all(repo, check=True)
+    assert any("version drift" in err for err in sync_errors)
+
+
+def test_check_version_parity_reports_missing_unparseable_and_invalid_versions(
+    tmp_path: Path,
+) -> None:
+    repo = _make_version_parity_repo(tmp_path)
+
+    (repo / "platforms" / "claude" / ".claude-plugin" / "plugin.json").unlink()
+    missing_errs = sync.check_version_parity(repo)
+    assert any("version missing:" in err and "plugin.json" in err for err in missing_errs)
+
+    (repo / "platforms" / "claude" / ".claude-plugin" / "plugin.json").write_text(
+        "{broken json", encoding="utf-8"
+    )
+    unparseable_errs = sync.check_version_parity(repo)
+    assert any("version unparseable:" in err and "plugin.json" in err for err in unparseable_errs)
+
+    (repo / "platforms" / "claude" / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "paddock", "version": "not-a-semver"}\n', encoding="utf-8"
+    )
+    invalid_errs = sync.check_version_parity(repo)
+    assert any("version invalid:" in err and "not-a-semver" in err for err in invalid_errs)
+
+
+def _parse_yaml_scalar(raw: str) -> Any:
+    val = raw.strip()
+    if val == "true":
+        return True
+    if val == "false":
+        return False
+    if val in ("null", "~"):
+        return None
+    if len(val) >= 2 and ((val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")):
+        return val[1:-1]
+    if val.startswith("[") and val.endswith("]"):
+        inner = val[1:-1].strip()
+        if not inner:
+            return []
+        return [_parse_yaml_scalar(part) for part in inner.split(",")]
+    return val
+
+
+def _split_yaml_key_value(content: str) -> tuple[str, str | None]:
+    if content.endswith(":"):
+        return content[:-1].strip(), None
+    if ": " in content:
+        key, val = content.split(": ", 1)
+        return key.strip(), val.strip()
+    raise ValueError(f"Unsupported YAML line syntax: {content!r}")
+
+
+def _parse_workflow_yaml(text: str) -> dict[str, Any]:
+    """Minimal stdlib YAML-subset parser supporting workflow mappings, lists, and `|` blocks."""
+    lines = text.splitlines()
+    tokens: list[tuple[int, str, Any]] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            idx += 1
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if stripped.startswith("- "):
+            tokens.append((indent, "seq", stripped[2:]))
+            idx += 1
+            continue
+
+        key, val = _split_yaml_key_value(stripped)
+        if val == "|":
+            idx += 1
+            block_lines: list[str] = []
+            while idx < len(lines):
+                nxt = lines[idx]
+                if not nxt.strip():
+                    block_lines.append("")
+                    idx += 1
+                    continue
+                nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+                if nxt_indent <= indent:
+                    break
+                block_lines.append(nxt)
+                idx += 1
+            while block_lines and not block_lines[-1].strip():
+                block_lines.pop()
+            parsed_val: Any = textwrap.dedent("\n".join(block_lines))
+        else:
+            parsed_val = None if val is None else _parse_yaml_scalar(val)
+            idx += 1
+        tokens.append((indent, "map", (key, parsed_val)))
+
+    def parse_block(pos: int, base_indent: int) -> tuple[Any, int]:
+        if pos >= len(tokens):
+            return {}, pos
+        _, kind, _ = tokens[pos]
+        if kind == "seq":
+            seq: list[Any] = []
+            while pos < len(tokens):
+                ind, k, payload = tokens[pos]
+                if ind < base_indent or (ind == base_indent and k != "seq"):
+                    break
+                if ind != base_indent:
+                    raise ValueError(f"Unexpected sequence indent {ind} != {base_indent}")
+                item_str = str(payload).strip()
+                pos += 1
+                if ": " in item_str or item_str.endswith(":"):
+                    item_key, item_raw = _split_yaml_key_value(item_str)
+                    item_dict: dict[str, Any] = {}
+                    item_indent = base_indent + 2
+                    if item_raw == "|":
+                        raise ValueError("Unsupported multiline block directly on sequence item")
+                    if item_raw is None:
+                        nested, pos = parse_block(pos, item_indent + 2)
+                        item_dict[item_key] = nested
+                    else:
+                        item_dict[item_key] = _parse_yaml_scalar(item_raw)
+                    if pos < len(tokens) and tokens[pos][0] >= item_indent and tokens[pos][1] == "map":
+                        rest, pos = parse_block(pos, item_indent)
+                        if not isinstance(rest, dict):
+                            raise ValueError("Expected mapping continuation in sequence item")
+                        item_dict.update(rest)
+                    seq.append(item_dict)
+                else:
+                    seq.append(_parse_yaml_scalar(item_str))
+            return seq, pos
+
+        mapping: dict[str, Any] = {}
+        while pos < len(tokens):
+            ind, k, payload = tokens[pos]
+            if ind < base_indent or k != "map":
+                break
+            if ind != base_indent:
+                raise ValueError(f"Unexpected mapping indent {ind} != {base_indent}")
+            key, val = payload
+            pos += 1
+            if val is None and pos < len(tokens) and tokens[pos][0] > base_indent:
+                nested, pos = parse_block(pos, tokens[pos][0])
+                mapping[key] = nested
+            else:
+                mapping[key] = val
+        return mapping, pos
+
+    parsed, next_pos = parse_block(0, 0)
+    assert next_pos == len(tokens)
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def test_github_workflows_structure_and_inline_scripts() -> None:
+    ci_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    release_path = REPO_ROOT / ".github" / "workflows" / "release.yml"
+    assert ci_path.is_file()
+    assert release_path.is_file()
+
+    ci = _parse_workflow_yaml(ci_path.read_text(encoding="utf-8"))
+    assert ci["name"] == "CI"
+    assert ci["on"] == {
+        "push": {"branches": ["main"]},
+        "pull_request": {"branches": ["main"]},
+    }
+    assert ci["permissions"] == {"contents": "read"}
+    ci_job = ci["jobs"]["test-and-package"]
+    assert ci_job["runs-on"] == "${{ matrix.os }}"
+    assert ci_job["strategy"]["fail-fast"] is False
+    assert set(ci_job["strategy"]["matrix"]["os"]) == {"ubuntu-latest", "windows-latest"}
+
+    ci_steps = ci_job["steps"]
+    ci_uses = [step["uses"] for step in ci_steps if "uses" in step]
+    assert "actions/checkout@v4" in ci_uses
+    assert "actions/setup-python@v5" in ci_uses
+    assert "astral-sh/setup-uv@v5" in ci_uses
+    setup_py = next(s for s in ci_steps if s.get("uses") == "actions/setup-python@v5")
+    assert setup_py["with"]["python-version"] == "3.12"
+
+    ci_runs = [step["run"] for step in ci_steps if "run" in step]
+    assert "python scripts/sync.py --check" in ci_runs
+    assert "python -m pytest -q" in ci_runs
+    assert "uv build --wheel --out-dir dist" in ci_runs
+
+    for step in ci_steps:
+        if step.get("shell") == "python":
+            ast.parse(step["run"], filename=str(ci_path))
+
+    wheel_check = next(s["run"] for s in ci_steps if "Verify wheel bundle" in s.get("name", ""))
+    assert "paddock/_bundle/.claude-plugin/marketplace.json" in wheel_check
+    assert "__pycache__" in wheel_check
+    assert ".pytest_cache" in wheel_check
+
+    smoke_step = next(s for s in ci_steps if "Smoke-test wheel" in s.get("name", ""))
+    assert smoke_step["env"] == {
+        "WORKSPACE_DIR": "${{ github.workspace }}",
+        "TEMP_ROOT": "${{ runner.temp }}",
+    }
+    assert "source_mode" in smoke_step["run"]
+    assert "bundle" in smoke_step["run"]
+    assert "models" in smoke_step["run"]
+
+    release = _parse_workflow_yaml(release_path.read_text(encoding="utf-8"))
+    assert release["name"] == "Release"
+    assert release["on"] == {"push": {"tags": ["v*"]}}
+    assert release["permissions"] == {"contents": "write"}
+
+    rel_job = release["jobs"]["release"]
+    assert rel_job["runs-on"] == "ubuntu-latest"
+    rel_steps = rel_job["steps"]
+    rel_uses = [step["uses"] for step in rel_steps if "uses" in step]
+    assert "actions/checkout@v4" in rel_uses
+    assert "actions/setup-python@v5" in rel_uses
+    assert "astral-sh/setup-uv@v5" in rel_uses
+
+    rel_runs = [step["run"] for step in rel_steps if "run" in step]
+    assert "python scripts/sync.py --check" in rel_runs
+    assert "python -m pytest -q" in rel_runs
+    assert "uv build --wheel --out-dir dist" in rel_runs
+
+    for step in rel_steps:
+        if step.get("shell") == "python":
+            ast.parse(step["run"], filename=str(release_path))
+
+    tag_step = next(s["run"] for s in rel_steps if "Validate release tag" in s.get("name", ""))
+    assert "GITHUB_REF_NAME" in tag_step
+    assert "pyproject.toml" in tag_step
+
+    archive_step = next(
+        s["run"] for s in rel_steps if "deterministic plugin archives" in s.get("name", "")
+    )
+    assert "paddock-antigravity-" in archive_step
+    assert "paddock-claude-" in archive_step
+    assert "SHA256SUMS.txt" in archive_step
+    assert "(2025, 1, 1, 0, 0, 0)" in archive_step
+    assert "__pycache__" in archive_step
+
+    publish_step = next(s for s in rel_steps if "Publish or update GitHub Release" in s.get("name", ""))
+    assert publish_step["env"] == {"GH_TOKEN": "${{ github.token }}"}
+    assert "gh release view" in publish_step["run"]
+    assert "gh release upload" in publish_step["run"]
+    assert "--clobber" in publish_step["run"]
+    assert "gh release create" in publish_step["run"]
+    assert "--verify-tag --generate-notes" in publish_step["run"]

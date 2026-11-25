@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paddock"
+version = "0.2.0"
+description = "Multi-platform orchestration loop and unified ~/.paddock/ typed memory suite"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+paddock = "paddock.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["paddock", "core"]
+exclude = [
+  "**/__pycache__",
+  "**/__pycache__/**",
+  "**/*.pyc",
+  "**/*.pyo",
+  "**/.pytest_cache",
+  "**/.pytest_cache/**",
+]
+
+[tool.hatch.build.targets.wheel.force-include]
+"core" = "paddock/_bundle/core"
+"platforms/antigravity" = "paddock/_bundle/platforms/antigravity"
+"platforms/claude" = "paddock/_bundle/platforms/claude"
+".claude-plugin/marketplace.json" = "paddock/_bundle/.claude-plugin/marketplace.json"

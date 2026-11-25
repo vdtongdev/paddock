@@ -6,10 +6,15 @@
 from __future__ import annotations
 
 import argparse
+import ast
+from collections.abc import Callable
+import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
+import tomllib
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
@@ -185,7 +190,131 @@ def sync_all(repo_root: Path, check: bool = False) -> list[str]:
                     changes.append(msg)
             changes.extend(_prune_stale_files(plat_agents_dst, expected_rendered_rels, check=check))
 
+    if check and _has_package_manifests(repo_root):
+        changes.extend(check_version_parity(repo_root))
+
     return changes
+
+
+_SEMVER_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\Z")
+
+
+def _validate_plain_semver(version: str) -> str | None:
+    if "\n" in version or "\r" in version or not _SEMVER_VERSION_RE.match(version):
+        return f"invalid semantic version {version!r}"
+    if "-" in version:
+        _, pre = version.split("-", 1)
+        if any(part == "" for part in pre.split(".")):
+            return f"invalid semantic version {version!r}"
+    return None
+
+
+def _extract_ast_str_constant(node: ast.AST | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _read_pyproject_version(path: Path) -> str:
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    project = data.get("project")
+    if not isinstance(project, dict) or not isinstance(project.get("version"), str):
+        raise ValueError("missing [project].version string")
+    return project["version"]
+
+
+def _find_module_target_value(path: Path, target_name: str) -> ast.AST | None:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    found: ast.AST | None = None
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == target_name for t in stmt.targets
+        ):
+            found = stmt.value
+        elif isinstance(stmt, ast.AnnAssign) and (
+            isinstance(stmt.target, ast.Name) and stmt.target.id == target_name
+        ):
+            found = stmt.value
+    return found
+
+
+def _read_init_version(path: Path) -> str:
+    found = _extract_ast_str_constant(_find_module_target_value(path, "__version__"))
+    if found is None:
+        raise ValueError("missing __version__ string literal")
+    return found
+
+
+def _read_json_version(path: Path) -> str:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("version"), str):
+        raise ValueError("missing top-level 'version' string")
+    return data["version"]
+
+
+def _read_mcp_server_version(path: Path) -> str:
+    value_node = _find_module_target_value(path, "SERVER_INFO")
+    found: str | None = None
+    if isinstance(value_node, ast.Dict):
+        for key_node, val_node in zip(value_node.keys, value_node.values):
+            if isinstance(key_node, ast.Constant) and key_node.value == "version":
+                found = _extract_ast_str_constant(val_node)
+    if found is None:
+        raise ValueError('missing SERVER_INFO["version"] string literal')
+    return found
+
+
+_VERSION_PARITY_SOURCES: tuple[tuple[str, Callable[[Path], str]], ...] = (
+    ("pyproject.toml", _read_pyproject_version),
+    ("paddock/__init__.py", _read_init_version),
+    ("platforms/antigravity/plugin.json", _read_json_version),
+    ("platforms/claude/.claude-plugin/plugin.json", _read_json_version),
+    ("core/memory/mcp_server.py", _read_mcp_server_version),
+    ("platforms/antigravity/scripts/paddock_core/mcp_server.py", _read_mcp_server_version),
+    ("platforms/claude/scripts/paddock_core/mcp_server.py", _read_mcp_server_version),
+)
+
+
+def _has_package_manifests(repo_root: Path) -> bool:
+    return (repo_root / "pyproject.toml").is_file() or (repo_root / "paddock" / "__init__.py").is_file()
+
+
+def check_version_parity(repo_root: Path) -> list[str]:
+    """Verify one identical semantic version across packaging, plugin manifests, and MCP servers."""
+    findings: list[str] = []
+    versions: dict[str, str] = {}
+
+    for rel_path, reader in _VERSION_PARITY_SOURCES:
+        full_path = repo_root / rel_path
+        if not full_path.is_file():
+            findings.append(f"version missing: {full_path}")
+            continue
+        try:
+            ver = reader(full_path)
+        except (
+            OSError,
+            UnicodeDecodeError,
+            ValueError,
+            SyntaxError,
+            tomllib.TOMLDecodeError,
+        ) as exc:
+            findings.append(f"version unparseable: {full_path} ({exc})")
+            continue
+        err = _validate_plain_semver(ver)
+        if err is not None:
+            findings.append(f"version invalid: {full_path} ({err})")
+            continue
+        versions[rel_path] = ver
+
+    if len(set(versions.values())) > 1:
+        anchor_rel, anchor_ver = next(iter(versions.items()))
+        for rel_path, ver in versions.items():
+            if ver != anchor_ver:
+                findings.append(
+                    f"version drift: {repo_root / rel_path} ({ver}) != {repo_root / anchor_rel} ({anchor_ver})"
+                )
+
+    return findings
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -210,6 +339,11 @@ def main(argv: list[str] | None = None) -> int:
 
     for item in findings:
         print(f"synced: {item}")
+    parity_errors = check_version_parity(repo_root) if _has_package_manifests(repo_root) else []
+    if parity_errors:
+        for item in parity_errors:
+            print(item, file=sys.stderr)
+        return 1
     if not findings:
         print("OK: already up to date")
     return 0
