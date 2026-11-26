@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-26
+
+### Fixed
+- Added a pre-flight Windows `uv tool` self-invocation guard (`_is_windows_uv_tool_self_invocation`, `_is_paddock_uv_receipt`, `_locked_update_payload`) in `paddock/updater.py` (`_run_uv_upgrade`) so `paddock update` detects running from a `uv tool`-installed `paddock.exe` environment on Windows and refuses to overwrite itself via `uv tool install --force`—preventing partial venv teardown (`ModuleNotFoundError: No module named 'paddock'`), leaving installed platform plugins and `~/.paddock/` untouched, and printing the two recovery commands (`uv tool install --force git+https://github.com/vdtongdev/paddock.git@<ref>` and `paddock install`) while preserving `--check`, `--dry-run`, `--plugins-only`, and missing-`uv` error behavior; updated `README.md` and added regression coverage in `tests/test_paddock_cli.py`.
+
 ## [0.3.1] - 2026-11-25
 
 ### Fixed
@@ -74,7 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clean 3,000-character problem truncation in `format_problems_capped()` without emitting a leading `; ...` prefix.
 - In-place atomic Antigravity plugin reinstall in `scripts/install.py` with stale-entry pruning to prevent Windows `[WinError 32]` directory handle locks.
 
-[Unreleased]: https://github.com/vdtongdev/paddock/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/vdtongdev/paddock/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/vdtongdev/paddock/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/vdtongdev/paddock/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vdtongdev/paddock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vdtongdev/paddock/releases/tag/v0.2.0

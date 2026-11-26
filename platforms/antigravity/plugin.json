@@ -2,7 +2,7 @@
   "name": "paddock",
   "displayName": "Paddock",
   "description": "Multi-platform orchestration loop and shared ~/.paddock/ typed memory suite for Antigravity.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "suggestedPrompts": [
     "Diagnose this bug in Mode: diagnose before fixing anything",
     "Write a spec and implementation plan for a new feature with approval gates",

@@ -18,7 +18,7 @@ import worktree  # noqa: E402
 
 SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
 DEFAULT_PROTOCOL_VERSION = "2025-03-26"
-SERVER_INFO = {"name": "paddock-worktree", "version": "0.3.1"}
+SERVER_INFO = {"name": "paddock-worktree", "version": "0.3.2"}
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {

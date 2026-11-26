@@ -78,7 +78,7 @@ paddock update --plugins-only
 
 *(Also supports `--platform <antigravity|claude|all>`, `--dry-run`, `--home <dir>`, and `--json`.)*
 
-> **Windows note:** Overwriting a running `paddock.exe` via `uv tool install --force` can trigger a file-in-use or access lock error (`WinError 5` / `WinError 32`). When that happens, `paddock update` leaves your installed plugins untouched and prints the two recovery commands to run directly in your terminal:
+> **Windows note:** On Windows, `paddock update` detects `uv tool`-installed `paddock.exe` self-invocation upfront and refuses to overwrite itself (and also catches `WinError 5` / `WinError 32` file-lock errors), leaving installed plugins and `~/.paddock/` untouched and printing the two recovery commands to run directly in your terminal:
 >
 > ```bash
 > uv tool install --force git+https://github.com/vdtongdev/paddock.git@<ref>

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from typing import Any
 import urllib.error
 import urllib.request
@@ -291,6 +292,75 @@ def _subprocess_env(paddock_home: Path | str | None) -> dict[str, str] | None:
     return env
 
 
+def _locked_update_payload(tool_spec: str, ref: str) -> dict[str, Any]:
+    """Build the `locked` payload emitted when Windows cannot overwrite the running CLI."""
+    cmd_upgrade = f"uv tool install --force {tool_spec}"
+    cmd_install = "paddock install"
+    return {
+        "action": "update",
+        "mode": "full",
+        "status": "locked",
+        "ok": False,
+        "exit_code": 1,
+        "target_ref": ref,
+        "error": (
+            "Cannot overwrite running paddock executable while it is in use. "
+            "Installed plugins were not modified. Run these commands to finish updating:"
+        ),
+        "recovery_commands": [cmd_upgrade, cmd_install],
+        "instructions": f"{cmd_upgrade}\n{cmd_install}",
+    }
+
+
+def _is_paddock_uv_receipt(prefix: Path) -> bool:
+    """Inspect `prefix / 'uv-receipt.toml'` to see if it belongs to a `paddock` `uv tool` install."""
+    receipt_path = prefix / "uv-receipt.toml"
+    is_paddock_dir = prefix.name.lower() == "paddock"
+    try:
+        if not receipt_path.is_file():
+            return False
+        data = tomllib.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return is_paddock_dir
+
+    tool = data.get("tool")
+    if not isinstance(tool, dict):
+        return False
+
+    entrypoints = tool.get("entrypoints")
+    if isinstance(entrypoints, list):
+        for entry in entrypoints:
+            if isinstance(entry, dict) and (
+                entry.get("name") == "paddock" or entry.get("from") == "paddock"
+            ):
+                return True
+
+    if is_paddock_dir:
+        requirements = tool.get("requirements")
+        if isinstance(requirements, list):
+            for req in requirements:
+                if isinstance(req, dict) and req.get("name") == "paddock":
+                    return True
+
+    return False
+
+
+def _is_windows_uv_tool_self_invocation() -> bool:
+    """Return True when running on Windows inside a `uv tool`-installed `paddock` environment."""
+    if sys.platform != "win32":
+        return False
+
+    prefixes: list[Path] = []
+    if sys.prefix:
+        prefixes.append(Path(sys.prefix))
+    if sys.executable:
+        exe_prefix = Path(sys.executable).parent.parent
+        if exe_prefix not in prefixes:
+            prefixes.append(exe_prefix)
+
+    return any(_is_paddock_uv_receipt(prefix) for prefix in prefixes)
+
+
 def _run_uv_upgrade(tool_spec: str, ref: str) -> dict[str, Any] | None:
     """Run `uv tool install --force <tool_spec>` and return an error payload on failure, else `None`."""
     uv_bin = shutil.which("uv")
@@ -307,6 +377,9 @@ def _run_uv_upgrade(tool_spec: str, ref: str) -> dict[str, Any] | None:
                 "Install uv (https://docs.astral.sh/uv/) or run `paddock update --plugins-only`."
             ),
         }
+
+    if _is_windows_uv_tool_self_invocation():
+        return _locked_update_payload(tool_spec, ref)
 
     uv_cmd = [uv_bin, "tool", "install", "--force", tool_spec]
     uv_exc: BaseException | None = None
@@ -336,22 +409,7 @@ def _run_uv_upgrade(tool_spec: str, ref: str) -> dict[str, Any] | None:
         "\n".join(part for part in (uv_stdout, uv_stderr, str(uv_exc or "")) if part)
     )
     if _is_windows_lock_error(combined, uv_exc):
-        cmd_upgrade = f"uv tool install --force {tool_spec}"
-        cmd_install = "paddock install"
-        return {
-            "action": "update",
-            "mode": "full",
-            "status": "locked",
-            "ok": False,
-            "exit_code": 1,
-            "target_ref": ref,
-            "error": (
-                "Cannot overwrite running paddock executable while it is in use. "
-                "Installed plugins were not modified. Run these commands to finish updating:"
-            ),
-            "recovery_commands": [cmd_upgrade, cmd_install],
-            "instructions": f"{cmd_upgrade}\n{cmd_install}",
-        }
+        return _locked_update_payload(tool_spec, ref)
 
     detail = _redact_secrets((uv_stderr or uv_stdout or str(uv_exc or "")).strip()) or f"exit {uv_rc}"
     return {
