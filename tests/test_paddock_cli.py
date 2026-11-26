@@ -825,6 +825,142 @@ def test_update_windows_self_update_lock_leaves_plugins_untouched(
     assert locked_json["recovery_commands"] == [expected_line_1, expected_line_2]
 
 
+def test_update_windows_uv_tool_self_invocation_skips_uv_and_leaves_plugins_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    tool_venv = tmp_path / "uv" / "tools" / "paddock"
+    (tool_venv / "Scripts").mkdir(parents=True)
+    (tool_venv / "uv-receipt.toml").write_text(
+        "[tool]\n"
+        'requirements = [{ name = "paddock", git = "https://github.com/vdtongdev/paddock.git?rev=v0.1.0" }]\n'
+        'entrypoints = [{ name = "paddock", install-path = "C:/Users/example/.local/bin/paddock.exe", from = "paddock" }]\n',
+        encoding="utf-8",
+    )
+
+    fake_home = tmp_path / "home"
+    (fake_home / ".gemini").mkdir(parents=True)
+    agy_plugin = fake_home / ".gemini" / "config" / "plugins" / "paddock"
+    agy_plugin.mkdir(parents=True)
+    sentinel_manifest = '{"name":"paddock","version":"0.1.0","sentinel":true}\n'
+    (agy_plugin / "plugin.json").write_text(sentinel_manifest, encoding="utf-8")
+
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "prefix", str(tool_venv))
+    monkeypatch.setattr(updater.sys, "executable", str(tool_venv / "Scripts" / "python.exe"))
+    monkeypatch.setattr(
+        updater.shutil,
+        "which",
+        lambda name: "C:\\uv\\uv.exe" if name == "uv" else None,
+    )
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "subprocess.run must not execute uv tool install --force during Windows self-update"
+            )
+        ),
+    )
+
+    assert cli.main(["update", "--version", "v0.3.1", "--home", str(fake_home)]) == 1
+    cap = capsys.readouterr()
+    err_lines = [line.strip() for line in cap.err.splitlines() if line.strip()]
+    expected_line_1 = "uv tool install --force git+https://github.com/vdtongdev/paddock.git@v0.3.1"
+    expected_line_2 = "paddock install"
+    assert expected_line_1 in err_lines
+    assert expected_line_2 in err_lines
+    assert err_lines.index(expected_line_2) == err_lines.index(expected_line_1) + 1
+    assert (agy_plugin / "plugin.json").read_text(encoding="utf-8") == sentinel_manifest
+
+    assert cli.main(["update", "--version", "v0.3.1", "--home", str(fake_home), "--json"]) == 1
+    locked_json = json.loads(capsys.readouterr().out)
+    assert locked_json["status"] == "locked"
+    assert locked_json["exit_code"] == 1
+    assert locked_json["recovery_commands"] == [expected_line_1, expected_line_2]
+    assert (agy_plugin / "plugin.json").read_text(encoding="utf-8") == sentinel_manifest
+
+    # --dry-run and --plugins-only still succeed under the same Windows uv tool prefix
+    assert (
+        cli.main(["update", "--version", "v0.3.1", "--dry-run", "--home", str(fake_home), "--json"])
+        == 0
+    )
+    dry_json = json.loads(capsys.readouterr().out)
+    assert dry_json["status"] == "dry-run"
+    assert (agy_plugin / "plugin.json").read_text(encoding="utf-8") == sentinel_manifest
+
+    assert cli.main(["update", "--plugins-only", "--home", str(fake_home), "--json"]) == 0
+    plugins_json = json.loads(capsys.readouterr().out)
+    assert plugins_json["mode"] == "plugins-only"
+    assert plugins_json["status"] == "updated"
+
+
+def test_is_windows_uv_tool_self_invocation_edge_cases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    paddock_venv = tmp_path / "uv" / "tools" / "Paddock"
+    (paddock_venv / "Scripts").mkdir(parents=True)
+    receipt = paddock_venv / "uv-receipt.toml"
+    receipt.write_text(
+        "[tool]\n"
+        'requirements = [{ name = "paddock" }]\n',
+        encoding="utf-8",
+    )
+
+    # Non-Windows never triggers pre-flight self-invocation guard
+    monkeypatch.setattr(updater.sys, "platform", "linux")
+    monkeypatch.setattr(updater.sys, "prefix", str(paddock_venv))
+    monkeypatch.setattr(updater.sys, "executable", str(paddock_venv / "Scripts" / "python.exe"))
+    assert updater._is_windows_uv_tool_self_invocation() is False
+
+    # Windows detects distinct sys.executable parent.parent when sys.prefix is base Python
+    base_prefix = tmp_path / "base_python"
+    base_prefix.mkdir()
+    monkeypatch.setattr(updater.sys, "platform", "win32")
+    monkeypatch.setattr(updater.sys, "prefix", str(base_prefix))
+    assert updater._is_windows_uv_tool_self_invocation() is True
+
+    # Malformed uv-receipt.toml falls back to prefix.name.lower() == "paddock"
+    receipt.write_text("[tool\nbad toml", encoding="utf-8")
+    assert updater._is_windows_uv_tool_self_invocation() is True
+
+    other_venv = tmp_path / "uv" / "tools" / "other"
+    (other_venv / "Scripts").mkdir(parents=True)
+    (other_venv / "uv-receipt.toml").write_text("[tool\nbad toml", encoding="utf-8")
+    monkeypatch.setattr(updater.sys, "prefix", str(other_venv))
+    monkeypatch.setattr(updater.sys, "executable", str(other_venv / "Scripts" / "python.exe"))
+    assert updater._is_windows_uv_tool_self_invocation() is False
+
+    # Unrelated receipt mentioning paddock only as a dependency is not self-invocation
+    (other_venv / "uv-receipt.toml").write_text(
+        "[tool]\n"
+        'requirements = [{ name = "other" }, { name = "paddock" }]\n'
+        'entrypoints = [{ name = "other", from = "other" }]\n',
+        encoding="utf-8",
+    )
+    assert updater._is_windows_uv_tool_self_invocation() is False
+
+    # Missing uv still reports missing-uv error rather than locked, and --check still succeeds
+    monkeypatch.setattr(updater.sys, "prefix", str(paddock_venv))
+    monkeypatch.setattr(updater.sys, "executable", str(paddock_venv / "Scripts" / "python.exe"))
+    receipt.write_text(
+        "[tool]\n"
+        'entrypoints = [{ name = "paddock", from = "paddock" }]\n',
+        encoding="utf-8",
+    )
+    assert cli.main(["update", "--check", "--version", "v0.3.1", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["mode"] == "check"
+
+    monkeypatch.setattr(updater.shutil, "which", lambda _name: None)
+    assert cli.main(["update", "--version", "v0.3.1", "--json"]) == 1
+    missing_uv = json.loads(capsys.readouterr().out)
+    assert missing_uv["status"] == "error"
+    assert "not found on PATH" in missing_uv["error"]
+
+
 def test_backward_compatible_script_wrappers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
