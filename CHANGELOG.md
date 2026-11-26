@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-25
+
+### Fixed
+- Resolved the post-Gate-2 worktree deadlock in which `branch-guard` (`PreToolUse`) blocked direct source edits on `main`/`master` while terminal sandboxes blocked writes to `.git/` (`.git/info/exclude`, `git worktree add`), by routing worktree lifecycle operations through a host-side MCP server (`paddock-worktree`) and supporting `Args.worktree` relative plan resolution in `platforms/antigravity/scripts/agy_hooks.py` (`_resolve_relative_candidate`, `_resolve_dir_arg`, `_handle_run_workflow_gate`) so plans copied into `.worktrees/<slug>` resolve against the worktree before falling back to `cwd` or `repo_root`.
+
+### Added
+- Zero-dependency Python 3.12+ stdlib worktree lifecycle engine (`core/git/__init__.py`, `core/git/worktree.py`) and JSON-RPC 2.0 stdio MCP server (`core/git/worktree_mcp_server.py`, server `paddock-worktree`) exposing `worktree_create`, `worktree_list`, and `worktree_remove` to manage `.git/info/exclude`, idempotently create or reuse `.worktrees/<slug>` on `<prefix>/<slug>`, copy matching untracked specs/plans preserving `mtime`, and run non-fatal `codegraph init -y` when `.codegraph/` is present.
+- `paddock worktree <create|list|remove>` CLI subcommands (`--prefix`, `--base`, `--plan-path`, `--copy`, `--no-codegraph`, `--delete-branch`, `--cwd`, `--json`) in `paddock/cli.py` for terminal parity and fallback outside MCP.
+- `paddock-worktree` MCP registration in `platforms/antigravity/mcp_config.json` and `platforms/claude/.mcp.json`, plus `PreToolUse` MCP hooks in `platforms/antigravity/hooks.json`, `platforms/antigravity/scripts/agy_hooks.py`, `platforms/claude/hooks/hooks.json`, and `platforms/claude/scripts/claude_hooks.py` enforcing Approval Gate 2 when `plan_path` is passed to `worktree_create` and requiring an `ask` confirmation prompt on `worktree_remove`.
+- Unit, stdio MCP framing, hook, CLI, and sync tests (`tests/test_worktree_core.py`, `tests/test_worktree_mcp.py`, and extensions to `tests/test_agy_hooks.py`, `tests/test_claude_hooks.py`, `tests/test_paddock_cli.py`, `tests/test_agents_standard.py`, `tests/test_sync_drift.py`).
+
+### Changed
+- Added `"mcp"` capability support to `core/config/agents.py` (`VALID_CAPABILITIES`, `CAPABILITY_TOOL_MAP`) and granted `mcp` to `core/agents/generalist.md` (keeping `shell` and `delegate` disallowed) so fast-tier `generalist` agents can run delegated `paddock-worktree` operations on Antigravity (`call_mcp_tool`) and Claude Code (`mcp__plugin_paddock_paddock-worktree__worktree_*`).
+- Updated `scripts/sync.py` (`CORE_GIT_FILES`, `_VERSION_PARITY_SOURCES`) and `paddock/installer.py` (`_REQUIRED_ANTIGRAVITY_ASSETS`, `_REQUIRED_BUNDLE_ASSETS`) to sync, bundle, and verify version parity across `worktree.py` and `worktree_mcp_server.py` (10 total version parity sources).
+- Updated `core/specs/loop-contract.md`, `core/skills/releasing/SKILL.md`, `platforms/antigravity/rules/AGENTS.md`, `platforms/*/skills/orchestrating/SKILL.md`, and `README.md` with `paddock-worktree` MCP and `paddock worktree` CLI documentation.
+
+### Security
+- Enforced strict slug (`SLUG_RE`), branch prefix (`VALID_PREFIXES`), and git ref (`BASE_REF_RE`) validation, symlink/Windows junction rejection (`_is_symlink_or_junction`, `_check_non_symlink_descendants`), `.worktrees/` containment checks, `copy_paths` traversal/escape/`.git/` bans, and `shell=False` subprocess execution in `core/git/worktree.py`.
+- Restricted `worktree_remove` and `paddock worktree remove` to Paddock-managed `.worktrees/<slug>` checkouts using strictly non-force `git worktree remove` and optional non-force `git branch -d` (refusing main/external checkouts, `--force`, `-D`, and protected branches `main`/`master`).
+
 ## [0.3.0] - 2026-11-25
 
 ### Added
@@ -54,6 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clean 3,000-character problem truncation in `format_problems_capped()` without emitting a leading `; ...` prefix.
 - In-place atomic Antigravity plugin reinstall in `scripts/install.py` with stale-entry pruning to prevent Windows `[WinError 32]` directory handle locks.
 
-[Unreleased]: https://github.com/vdtongdev/paddock/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/vdtongdev/paddock/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/vdtongdev/paddock/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vdtongdev/paddock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vdtongdev/paddock/releases/tag/v0.2.0
